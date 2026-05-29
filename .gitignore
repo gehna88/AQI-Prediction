@@ -1,0 +1,9 @@
+venv/
+.venv/
+.env
+__pycache__/
+*.pyc
+*.pkl
+*.keras
+*.dll
+*.sogit add .gitignore
