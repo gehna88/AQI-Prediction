@@ -118,8 +118,15 @@ def fetch_current():
                           if not np.isnan(sol) else 0,
         "pressure_diff":  np.nan,
     }
-
 def store_features(df):
+    # fix column types to match Hopsworks schema
+    df["aqi"]         = df["aqi"].astype(float)
+    df["hour"]        = df["hour"].astype(int)
+    df["day_of_week"] = df["day_of_week"].astype(int)
+    df["month"]       = df["month"].astype(int)
+    df["is_weekend"]  = df["is_weekend"].astype(int)
+    df["is_daytime"]  = df["is_daytime"].astype(int)
+
     print("Connecting to Hopsworks...")
     project = hopsworks.login(
         project=os.getenv("HOPSWORKS_PROJECT"),
@@ -136,6 +143,7 @@ def store_features(df):
     fg.insert(df, write_options={"wait_for_job": False})
     print(f"Stored {len(df)} rows, "
           f"{len(df.columns)} columns")
+    
 
 if __name__ == "__main__":
     print("=== AQI Feature Pipeline ===")
