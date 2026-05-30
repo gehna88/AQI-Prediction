@@ -218,9 +218,16 @@ def compute_features(df):
                 df[col] = df[col].fillna(0.0)
             else:
                 df[col] = df[col].fillna(median_val)
-
     print(f"NaN remaining after fill: "
           f"{df.isna().sum().sum()}")
+
+    # enforce consistent types
+    df["aqi"]         = df["aqi"].round().astype("int64")
+    df["hour"]        = df["hour"].astype("int64")
+    df["day_of_week"] = df["day_of_week"].astype("int64")
+    df["month"]       = df["month"].astype("int64")
+    df["is_weekend"]  = df["is_weekend"].astype("int64")
+    df["is_daytime"]  = df["is_daytime"].astype("int64")
 
     df["timestamp"] = df["timestamp"].astype(str)
     return df
