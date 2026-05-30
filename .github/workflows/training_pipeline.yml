@@ -1,8 +1,8 @@
-name: Feature Pipeline (hourly)
+name: Training Pipeline (daily)
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
 jobs:
@@ -16,10 +16,10 @@ jobs:
           python-version: "3.10"
 
       - name: Install dependencies
-        run: pip install requests pandas numpy python-dotenv hopsworks==4.7.* pyarrow confluent-kafka
+        run: pip install requests pandas numpy python-dotenv hopsworks==4.7.* pyarrow confluent-kafka scikit-learn xgboost joblib
 
-      - name: Run feature pipeline
-        run: python pipelines/feature_pipeline.py
+      - name: Run training pipeline
+        run: python pipelines/training_pipeline.py
         env:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
