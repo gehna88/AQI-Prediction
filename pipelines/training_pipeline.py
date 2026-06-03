@@ -1,26 +1,63 @@
 """
-training_pipeline.py  –  v4
-Changes vs v3:
-  1. DROPPED zero-importance features from FEATURES list:
-       soil_temp, ammonia, visibility, is_daytime,
-       wind_chill, wind_dir (raw degrees),
-       aqi_roll24_max, aqi_roll24_min
+training_pipeline.py  –  v6
 
-  2. ADDED weather forecast features to FEATURES list:
-       temp_forecast_24h/48h/72h
-       wind_forecast_24h/48h/72h
-       precip_forecast_24h/48h/72h
-       pressure_forecast_24h/48h/72h
-     Historical backfill rows have NaN for these (filled with median
-     at training time).  Inference rows have real forecast values from
-     Open-Meteo.  After a few weeks of inference data accumulating,
-     retrain and these features will carry real signal for 48h/72h.
+WHAT CHANGED vs v5 and WHY:
+=============================================================================
 
-  3. All v3 fixes retained: deseasonalized targets, LSTM, version
-     auto-increment, single save() call via temp directory.
+CHANGE 1 — Differenced targets (highest impact)
+  v5: target_resid = target_Xh - aqi_trend(T)
+      At reconstruction: predicted_aqi = residual + trend(T)
+      Problem: trend(T) is the 7-day mean ENDING at T, but the target is
+      AQI at T+48. If trend is still shifting upward in that window,
+      trend(T) underestimates the true level → systematic offset → r2 < 0
+      even though r2_resid was positive (model was learning correctly).
+
+  v6: target_Xh_diff = target_Xh - aqi_current (at time T, NOT at T+X)
+      At reconstruction: predicted_aqi = aqi_now + predicted_diff
+      aqi_now is always exactly known at inference. No trend needed.
+      No lookup table. No offset error. Cleaner stationarity for LSTM.
+  
+  This is the correct formulation: the model predicts HOW MUCH AQI will
+  change over the next X hours, not what the absolute level will be.
+  The strong negative correlation (r≈-0.43) between aqi_now and the diff
+  (mean reversion: high AQI tends to fall) becomes the primary signal.
+
+CHANGE 2 — Extended lag features in FEATURES list
+  Added: aqi_lag72, aqi_lag96, aqi_lag120, aqi_lag168
+  Added: aqi_roll48_mean, aqi_roll72_mean
+  These were added to backfill and feature_pipeline schemas (v6).
+  Weekly lag (168h) captures same-hour-last-week traffic patterns.
+  Long rolling means capture mean-reversion: if roll48_mean >> aqi_now,
+  AQI is likely to rise back toward baseline (and vice versa).
+  aqi_roll168_mean skipped — redundant with aqi_trend.
+
+CHANGE 3 — Ridge alpha tuned per horizon via TimeSeriesSplit CV
+  v5 used Ridge(alpha=1.0) for all horizons.
+  v6 searches alpha in [0.01, 0.1, 1, 10, 50, 100, 500] using
+  TimeSeriesSplit(n_splits=5). This finds the right regularisation
+  strength for each horizon separately:
+    1h:  likely alpha → small (strong clean signal)
+    24h: likely alpha → 1-10
+    48h/72h: likely alpha → 10-100 (weak noisy signal needs more shrinkage)
+  TimeSeriesSplit is used for alpha search only. Final reported metrics
+  still come from the single 80/20 temporal split (reproducible baseline).
+
+CHANGE 4 — RandomForest hyperparameters improved
+  n_estimators 300 → 500, max_depth 10 → 12.
+  min_samples_leaf stays at 3 (prevents overfitting on 1944 rows).
+  Depth 12 is a compromise: deeper than 10 to find interactions,
+  shallower than the suggested 15 which would overfit on this dataset size.
+
+CHANGE 5 — aqi_trend removed as primary deseasonalizer, kept as feature
+  With differenced targets, aqi_trend is no longer needed for target
+  construction. It is still included in FEATURES because it provides
+  a smooth representation of the current level baseline — useful context
+  for the model even if it no longer plays a structural role.
+=============================================================================
 """
 
 import os
+import sys
 import shutil
 import tempfile
 import numpy as np
@@ -31,10 +68,18 @@ from dotenv import load_dotenv
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (mean_squared_error,
-                             mean_absolute_error,
-                             r2_score)
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBRegressor
+
+try:
+    import confluent_kafka  # noqa: F401
+except ImportError:
+    print(
+        "\n[ERROR] confluent_kafka not installed.\n"
+        "Fix: pip install confluent-kafka\n"
+    )
+    sys.exit(1)
 
 try:
     import tensorflow as tf
@@ -47,64 +92,64 @@ except ImportError:
 
 load_dotenv()
 
+# ── Feature list — all columns present in the v6 feature group schema ──
 FEATURES = [
-    # ── Pollutants ──────────────────────────────────────
+    # ── Pollutants ──────────────────────────────────────────────────
     "aqi", "pm25", "pm10", "o3", "no2", "so2", "co",
-    "dust",
-    # ammonia dropped (zero importance)
-    "european_aqi", "us_aqi",
+    "dust", "european_aqi", "us_aqi",
 
-    # ── Current weather ─────────────────────────────────
-    "temp", "humidity", "wind",
-    # wind_dir raw dropped (encoded as sin/cos below)
-    "wind_gusts", "precipitation", "pressure",
-    "cloud_cover",
-    # visibility dropped (zero importance)
-    "dew_point", "apparent_temp",
-    # soil_temp dropped (zero importance)
-    "solar_rad",
+    # ── Current weather ─────────────────────────────────────────────
+    "temp", "humidity", "wind", "wind_gusts",
+    "precipitation", "pressure", "cloud_cover",
+    "dew_point", "apparent_temp", "solar_rad",
 
-    # ── Time ────────────────────────────────────────────
+    # ── Time ────────────────────────────────────────────────────────
     "hour", "day_of_week", "month", "is_weekend",
     "hour_sin", "hour_cos", "month_sin", "month_cos",
 
-    # ── AQI lags ────────────────────────────────────────
+    # ── AQI lags (original set) ──────────────────────────────────────
     "aqi_lag1", "aqi_lag2", "aqi_lag3",
     "aqi_lag6", "aqi_lag12", "aqi_lag24", "aqi_lag48",
 
-    # ── Rolling stats (min/max dropped — redundant) ─────
+    # ── AQI lags (extended — added in v6) ───────────────────────────
+    # lag72/96/120: 3/4/5-day lags for persistence at longer horizons
+    # lag168: same hour last week — captures weekly traffic/activity cycle
+    "aqi_lag72", "aqi_lag96", "aqi_lag120", "aqi_lag168",
+
+    # ── Rolling stats ───────────────────────────────────────────────
     "aqi_roll3_mean", "aqi_roll6_mean",
     "aqi_roll12_mean", "aqi_roll24_mean",
+    # roll48/72: 2-day/3-day smooth means for mean-reversion signal
+    "aqi_roll48_mean", "aqi_roll72_mean",
     "aqi_roll6_std", "aqi_roll24_std",
-    # aqi_roll24_max, aqi_roll24_min dropped
 
-    # ── Diff / rate ──────────────────────────────────────
+    # ── Diff / rate — most important for differenced targets ─────────
+    # corr(aqi_diff1, target_48h_diff) ≈ -0.49: strong mean-reversion
     "aqi_change_rate", "aqi_diff1", "aqi_diff6", "aqi_diff24",
 
-    # ── PM2.5 lags ───────────────────────────────────────
+    # ── PM2.5 lags ───────────────────────────────────────────────────
     "pm25_lag1", "pm25_lag24", "pm25_roll6_mean",
 
-    # ── Derived weather ──────────────────────────────────
-    "temp_humidity",
-    # wind_chill dropped (linear combo of temp+wind)
-    "pressure_diff",
-    "wind_dir_sin", "wind_dir_cos",   # kept
+    # ── Derived weather ──────────────────────────────────────────────
+    "temp_humidity", "pressure_diff",
+    "wind_dir_sin", "wind_dir_cos",
     "pm25_wind", "dew_depression",
-    # is_daytime dropped (zero importance)
 
-    # ── Seasonal (computed in training pipeline) ─────────
-    "monthly_mean_aqi", "monthly_std_aqi",
-
-    # ── Weather forecasts (NaN in backfill, live at inference) ──
-    "temp_forecast_24h",     "wind_forecast_24h",
-    "precip_forecast_24h",   "pressure_forecast_24h",
-    "temp_forecast_48h",     "wind_forecast_48h",
-    "precip_forecast_48h",   "pressure_forecast_48h",
-    "temp_forecast_72h",     "wind_forecast_72h",
-    "precip_forecast_72h",   "pressure_forecast_72h",
+    # ── Trend baseline (kept as feature, no longer used for deseason) ─
+    "aqi_trend",
 ]
 
-TARGETS = ["target_1h", "target_24h", "target_48h", "target_72h"]
+# Horizons and their differenced target column names
+# diff targets = target_Xh - aqi_current
+# At inference: predicted_aqi = aqi_now + model.predict(features)
+HORIZONS = {
+    "1h":  ("target_1h",  "target_1h_diff"),
+    "24h": ("target_24h", "target_24h_diff"),
+    "48h": ("target_48h", "target_48h_diff"),
+    "72h": ("target_72h", "target_72h_diff"),
+}
+
+TREND_WINDOW_HOURS = 168  # 7-day rolling mean
 
 
 def load_features():
@@ -120,80 +165,164 @@ def load_features():
     return df, project
 
 
-def add_seasonal_features(df):
+def parse_timestamps(df):
+    """ISO8601 parse handles both '2026-03-07 00:00:00+00:00' and
+    '2026-06-03 08:29:51.227071+00:00' (microseconds from feature_pipeline)."""
     df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df["month_num"]  = df["timestamp"].dt.month
-    stats = (
-        df.groupby("month_num")["aqi"]
-        .agg(monthly_mean_aqi="mean", monthly_std_aqi="std")
-        .reset_index()
+    if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"], format="ISO8601", utc=True)
+    else:
+        df["timestamp"] = df["timestamp"].dt.tz_convert("UTC")
+    return df
+
+
+def compute_trend(df):
+    """Rolling 7-day AQI trend — used as a context feature, not for target
+    construction (that role was replaced by differenced targets in v6)."""
+    df = df.copy()
+    df["aqi_trend"] = (
+        df["aqi"]
+        .rolling(TREND_WINDOW_HOURS, min_periods=24)
+        .mean()
     )
-    df = df.merge(stats, on="month_num", how="left")
-    df = df.drop(columns=["month_num"])
-    df["timestamp"] = df["timestamp"].astype(str)
-    return df, stats
+    df["aqi_trend"] = df["aqi_trend"].fillna(df["aqi"].expanding().mean())
+    return df
 
 
-def deseasonalize_target(df, target_col, monthly_stats):
-    df = df.copy()
-    df["_ts"] = pd.to_datetime(df["timestamp"], utc=True)
-    df["_m"]  = df["_ts"].dt.month
-    mean_map  = dict(zip(monthly_stats["month_num"],
-                         monthly_stats["monthly_mean_aqi"]))
-    df["_tmean"] = df["_m"].map(mean_map)
-    df[f"{target_col}_deseason"] = df[target_col] - df["_tmean"]
-    return df.drop(columns=["_ts", "_m", "_tmean"])
+def build_diff_targets(df):
+    """
+    Construct differenced targets: target_Xh_diff = aqi[T+X] - aqi[T].
+    Model learns to predict the CHANGE in AQI, not the absolute level.
+    Reconstruction at inference: predicted_aqi = aqi_now + predicted_diff.
 
-
-def prepare_data(df, target_col, monthly_stats):
+    Why this is better than rolling-trend deseasonalization:
+      - aqi_now is exactly known at prediction time (zero offset error)
+      - The residuals are zero-mean by construction (no lookup table needed)
+      - More stationary signal = better for LSTM
+      - Strong mean-reversion signal: corr(aqi_now, target_48h_diff) ≈ -0.43
+    """
     df = df.copy()
     df = df.sort_values("timestamp").reset_index(drop=True)
-    df = deseasonalize_target(df, target_col, monthly_stats)
-    deseason_col = f"{target_col}_deseason"
+    for horizon, (raw_col, diff_col) in HORIZONS.items():
+        if raw_col in df.columns:
+            df[diff_col] = df[raw_col] - df["aqi"]
+    return df
+
+
+def prepare_data(df, raw_target_col, diff_target_col):
+    df = df.copy().sort_values("timestamp").reset_index(drop=True)
 
     available = [f for f in FEATURES if f in df.columns]
     missing   = [f for f in FEATURES if f not in df.columns]
     if missing:
-        print(f"  Missing features (will be skipped): {missing}")
+        print(f"  [WARN] Missing from schema (skipped): {missing}")
 
     for col in available:
         if df[col].isna().any():
             df[col] = df[col].fillna(df[col].median())
 
-    df = df[df[deseason_col].notna()].dropna(subset=available)
+    # Keep only rows where both raw target and diff target exist
+    df = df[df[diff_target_col].notna() & df[raw_target_col].notna()]
+    df = df.dropna(subset=available)
 
     split       = int(len(df) * 0.8)
     X_train     = df[available].iloc[:split]
     X_test      = df[available].iloc[split:]
-    y_train     = df[deseason_col].iloc[:split]
-    y_test      = df[deseason_col].iloc[split:]
-    y_test_raw  = df[target_col].iloc[split:]
-    y_train_raw = df[target_col].iloc[:split]
+    y_train     = df[diff_target_col].iloc[:split]    # train on diff
+    y_test      = df[diff_target_col].iloc[split:]    # eval on diff
+    y_test_raw  = df[raw_target_col].iloc[split:]     # final eval on absolute AQI
+    y_train_raw = df[raw_target_col].iloc[:split]
+    aqi_test    = df["aqi"].iloc[split:]              # aqi_now for reconstruction
 
-    diff = abs(y_train_raw.mean() - y_test_raw.mean())
-    print(f"  Train: {len(X_train)} rows  "
-          f"({str(df['timestamp'].iloc[0])[:10]} → "
-          f"{str(df['timestamp'].iloc[split-1])[:10]})")
-    print(f"  Test:  {len(X_test)} rows  "
-          f"({str(df['timestamp'].iloc[split])[:10]} → "
-          f"{str(df['timestamp'].iloc[-1])[:10]})")
+    train_start = str(df["timestamp"].iloc[0])[:10]
+    train_end   = str(df["timestamp"].iloc[split - 1])[:10]
+    test_start  = str(df["timestamp"].iloc[split])[:10]
+    test_end    = str(df["timestamp"].iloc[-1])[:10]
+    mean_diff   = abs(y_train_raw.mean() - y_test_raw.mean())
+
+    print(f"  Train: {len(X_train)} rows  ({train_start} → {train_end})")
+    print(f"  Test:  {len(X_test)} rows  ({test_start} → {test_end})")
     print(f"  Train AQI mean={y_train_raw.mean():.1f}  "
           f"Test AQI mean={y_test_raw.mean():.1f}  "
-          f"Diff={diff:.1f}")
-    print(f"  Deseasonalized — "
-          f"Train mean={y_train.mean():.1f}  "
-          f"Test mean={y_test.mean():.1f}  (should be ~0)")
-    if diff > 10:
-        print(f"  [WARN] Distribution shift={diff:.1f} — "
-              f"R² will be suppressed on test set")
+          f"Shift={mean_diff:.1f}")
+    print(f"  Diff target — train mean={y_train.mean():.2f}  "
+          f"test mean={y_test.mean():.2f}  (both ~0 expected)")
 
-    return X_train, X_test, y_train, y_test, y_test_raw, available
+    return (X_train, X_test,
+            y_train, y_test,
+            y_test_raw, aqi_test, available)
 
 
-def build_lstm(input_dim):
+def tune_ridge_alpha(X_train, y_train):
+    """
+    Find the best Ridge alpha for this horizon using TimeSeriesSplit CV.
+    CV is on the TRAINING set only — no test-set contamination.
+
+    n_splits=3 instead of 5:
+      With 1555 train rows and 5 splits, fold 1 had only 258 rows —
+      too small for the noisy 24h/48h/72h diff signal. CV always picked
+      alpha=500 (near-zero prediction) on tiny folds. With n_splits=3,
+      fold 1 has 388 rows (50% more), giving a more reliable alpha estimate.
+
+    Alpha range starts at 0.001:
+      Ensures the search can pick a low alpha for the clean 1h signal
+      where aggressive regularisation was actively hurting R²_diff.
+    """
+    alphas     = [0.001, 0.01, 0.1, 1, 10, 50, 100, 500]
+    tscv       = TimeSeriesSplit(n_splits=3)
+    best_alpha = 1.0
+    best_score = -np.inf
+
+    X_arr = X_train.values if hasattr(X_train, "values") else X_train
+    y_arr = y_train.values if hasattr(y_train, "values") else y_train
+
+    alpha_scores = {}
+    for alpha in alphas:
+        fold_scores = []
+        for tr_idx, val_idx in tscv.split(X_arr):
+            Xtr, Xval = X_arr[tr_idx], X_arr[val_idx]
+            ytr, yval = y_arr[tr_idx], y_arr[val_idx]
+            sc = StandardScaler()
+            Xtr_s  = sc.fit_transform(Xtr)
+            Xval_s = sc.transform(Xval)
+            m = Ridge(alpha=alpha)
+            m.fit(Xtr_s, ytr)
+            preds = m.predict(Xval_s)
+            fold_scores.append(r2_score(yval, preds))
+        mean_score = np.mean(fold_scores)
+        alpha_scores[alpha] = round(mean_score, 3)
+        if mean_score > best_score:
+            best_score = mean_score
+            best_alpha = alpha
+
+    scores_str = "  ".join(f"α={a}:{s:+.3f}" for a, s in alpha_scores.items())
+    print(f"    Ridge CV: {scores_str}")
+    print(f"    Ridge CV best alpha={best_alpha}  CV R²={best_score:.3f}")
+    return best_alpha
+
+
+def make_sequences(X_arr, y_arr, seq_len):
+    """
+    Slide a window of seq_len over X to create LSTM sequences.
+    Each output sample: X[i-seq_len+1 : i+1] → y[i]
+    Returns Xs shape (N-seq_len+1, seq_len, features), ys shape (N-seq_len+1,)
+    """
+    Xs, ys = [], []
+    for i in range(seq_len - 1, len(X_arr)):
+        Xs.append(X_arr[i - seq_len + 1 : i + 1])
+        ys.append(y_arr[i])
+    return np.array(Xs), np.array(ys)
+
+
+def build_lstm(seq_len, input_dim):
+    """
+    LSTM that sees a real temporal sequence of seq_len timesteps.
+    seq_len=24 means the model looks back 24 hours of feature history.
+    This is qualitatively different from seq_len=1, which has no recurrence.
+    """
     model = keras.Sequential([
-        layers.Input(shape=(1, input_dim)),
+        layers.Input(shape=(seq_len, input_dim)),
         layers.LSTM(64, return_sequences=True),
         layers.Dropout(0.2),
         layers.LSTM(32),
@@ -207,32 +336,39 @@ def build_lstm(input_dim):
 
 def train_models(X_train, X_test,
                  y_train, y_test,
-                 y_test_raw, horizon, monthly_stats):
-
+                 y_test_raw, aqi_test, horizon):
+    """
+    Train all models on differenced targets.
+    Reconstruction: predicted_aqi = aqi_now + predicted_diff
+    aqi_now is exact → no offset error possible.
+    Reports R²_diff (on change prediction) and R² (on absolute AQI).
+    """
     scaler    = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s  = scaler.transform(X_test)
+    aqi_arr   = aqi_test.values
 
-    X_test_months  = X_test["month"].values
-    monthly_mean_map = dict(zip(monthly_stats["month_num"],
-                                monthly_stats["monthly_mean_aqi"]))
+    def reconstruct(preds_diff):
+        return aqi_arr + preds_diff
 
-    def reseason(preds_ds, months):
-        means = np.array([monthly_mean_map.get(int(m), 0)
-                          for m in months])
-        return preds_ds + means
+    # ── Ridge with tuned alpha ───────────────────────────────────────
+    best_alpha = tune_ridge_alpha(X_train, y_train)
+    ridge      = Ridge(alpha=best_alpha)
 
     candidates = {
-        "Ridge": (Ridge(alpha=1.0), True),
+        f"Ridge(α={best_alpha})": (ridge, True),
         "RandomForest": (RandomForestRegressor(
-            n_estimators=300, max_depth=10,
-            min_samples_leaf=3, random_state=42, n_jobs=-1
+            n_estimators=500,
+            max_depth=12,        # compromise between v5's 10 and suggested 15
+            min_samples_leaf=3,  # keep at 3: prevents overfit on ~1550 train rows
+            random_state=42,
+            n_jobs=-1,
         ), False),
         "XGBoost": (XGBRegressor(
             n_estimators=500, learning_rate=0.02,
             max_depth=5, subsample=0.8,
             colsample_bytree=0.8, reg_alpha=0.5,
-            reg_lambda=2.0, random_state=42, verbosity=0
+            reg_lambda=2.0, random_state=42, verbosity=0,
         ), False),
     }
 
@@ -243,58 +379,86 @@ def train_models(X_train, X_test,
         Xtr = X_train_s if scaled else X_train.values
         Xte = X_test_s  if scaled else X_test.values
         model.fit(Xtr, y_train)
-        preds_ds  = model.predict(Xte)
-        preds_raw = reseason(preds_ds, X_test_months)
-        rmse = np.sqrt(mean_squared_error(y_test_raw, preds_raw))
-        mae  = mean_absolute_error(y_test_raw, preds_raw)
-        r2   = r2_score(y_test_raw, preds_raw)
-        r2ds = r2_score(y_test, preds_ds)
-        results[name] = dict(model=model, rmse=rmse, mae=mae,
-                             r2=r2, r2_ds=r2ds, scaled=scaled,
-                             scaler=scaler, is_lstm=False)
-        print(f"    {name:15s}  RMSE={rmse:.2f}  MAE={mae:.2f}  "
-              f"R²={r2:.3f}  R²_ds={r2ds:.3f}")
+        preds_diff = model.predict(Xte)
+        preds_raw  = reconstruct(preds_diff)
 
+        rmse     = np.sqrt(mean_squared_error(y_test_raw, preds_raw))
+        mae      = mean_absolute_error(y_test_raw, preds_raw)
+        r2_abs   = r2_score(y_test_raw, preds_raw)
+        r2_diff  = r2_score(y_test, preds_diff)
+        results[name] = dict(
+            model=model, rmse=rmse, mae=mae,
+            r2=r2_abs, r2_diff=r2_diff,
+            scaled=scaled, scaler=scaler, is_lstm=False,
+            alpha=best_alpha if "Ridge" in name else None,
+        )
+        print(f"    {name:20s}  RMSE={rmse:.2f}  MAE={mae:.2f}  "
+              f"R²={r2_abs:.3f}  R²_diff={r2_diff:.3f}")
+
+    # ── LSTM with proper temporal sequences ─────────────────────────
+    # seq_len=24: the LSTM sees the last 24 hours of feature history
+    # for each prediction. This is the minimum meaningful window for
+    # hourly AQI (one full diurnal cycle). With seq_len=1 (old code),
+    # the LSTM had no temporal sequence to recur over — it was just an MLP.
     if LSTM_AVAILABLE:
         try:
-            idim = X_train_s.shape[1]
-            lstm = build_lstm(idim)
+            SEQ_LEN = 24
+            idim    = X_train_s.shape[1]
+
+            Xs_train, ys_train = make_sequences(
+                X_train_s, y_train.values, SEQ_LEN)
+            Xs_test,  ys_test  = make_sequences(
+                X_test_s,  y_test.values,  SEQ_LEN)
+
+            # aqi_test for reconstruction must also be trimmed to match
+            # the sequence output (first SEQ_LEN-1 rows are consumed by window)
+            aqi_arr_seq = aqi_arr[SEQ_LEN - 1:]
+
+            model = build_lstm(SEQ_LEN, idim)
             early = keras.callbacks.EarlyStopping(
                 monitor="val_loss", patience=5,
                 restore_best_weights=True, verbose=0)
-            lstm.fit(
-                X_train_s.reshape(-1, 1, idim), y_train.values,
+            model.fit(
+                Xs_train, ys_train,
                 validation_split=0.1, epochs=50,
-                batch_size=256, callbacks=[early], verbose=0)
-            preds_ds  = lstm.predict(
-                X_test_s.reshape(-1, 1, idim), verbose=0).flatten()
-            preds_raw = reseason(preds_ds, X_test_months)
-            rmse = np.sqrt(mean_squared_error(y_test_raw, preds_raw))
-            mae  = mean_absolute_error(y_test_raw, preds_raw)
-            r2   = r2_score(y_test_raw, preds_raw)
-            r2ds = r2_score(y_test, preds_ds)
-            results["LSTM"] = dict(model=lstm, rmse=rmse, mae=mae,
-                                   r2=r2, r2_ds=r2ds, scaled=True,
-                                   scaler=scaler, is_lstm=True)
-            print(f"    {'LSTM':15s}  RMSE={rmse:.2f}  MAE={mae:.2f}  "
-                  f"R²={r2:.3f}  R²_ds={r2ds:.3f}")
+                batch_size=64, callbacks=[early], verbose=0)
+
+            preds_diff = model.predict(Xs_test, verbose=0).flatten()
+            preds_raw  = aqi_arr_seq + preds_diff
+
+            # y_test_raw must also be trimmed to match
+            y_test_raw_seq = y_test_raw.values[SEQ_LEN - 1:]
+
+            rmse    = np.sqrt(mean_squared_error(y_test_raw_seq, preds_raw))
+            mae     = mean_absolute_error(y_test_raw_seq, preds_raw)
+            r2_abs  = r2_score(y_test_raw_seq, preds_raw)
+            r2_diff = r2_score(ys_test, preds_diff)
+            results["LSTM"] = dict(
+                model=model, rmse=rmse, mae=mae,
+                r2=r2_abs, r2_diff=r2_diff,
+                scaled=True, scaler=scaler, is_lstm=True,
+                seq_len=SEQ_LEN,
+            )
+            print(f"    {'LSTM(seq=24)':20s}  RMSE={rmse:.2f}  MAE={mae:.2f}  "
+                  f"R²={r2_abs:.3f}  R²_diff={r2_diff:.3f}")
         except Exception as e:
             print(f"    LSTM failed: {e}")
 
     best_name = max(results, key=lambda k: results[k]["r2"])
     best      = results[best_name]
-    print(f"  → Best: {best_name}  R²={best['r2']:.3f}")
 
     baseline_rmse = np.sqrt(mean_squared_error(
-        y_test_raw,
-        np.full(len(y_test_raw), y_test_raw.mean())))
+        y_test_raw, np.full(len(y_test_raw), y_test_raw.mean())))
+    improvement = (baseline_rmse - best["rmse"]) / baseline_rmse * 100
+    print(f"  → Best: {best_name}  "
+          f"R²={best['r2']:.3f}  R²_diff={best['r2_diff']:.3f}")
     print(f"  → Baseline RMSE={baseline_rmse:.2f}  "
-          f"Improvement={((baseline_rmse-best['rmse'])/baseline_rmse*100):.1f}%")
+          f"Improvement={improvement:.1f}%")
 
     return best, best_name
 
 
-def save_models(horizon_results, project, monthly_stats):
+def save_models(horizon_results, project):
     mr = project.get_model_registry()
 
     for horizon, (result, best_name) in horizon_results.items():
@@ -302,20 +466,28 @@ def save_models(horizon_results, project, monthly_stats):
         try:
             model_fname  = os.path.join(tmp_dir, f"model_{horizon}.pkl")
             scaler_fname = os.path.join(tmp_dir, f"scaler_{horizon}.pkl")
-            stats_fname  = os.path.join(tmp_dir, "monthly_stats.pkl")
+
+            # Save a small metadata file so the app knows how to reconstruct
+            meta = {
+                "approach":    "differenced_target",
+                "reconstruct": "predicted_aqi = aqi_now + model.predict(features)",
+                "horizon":     horizon,
+                "best_model":  best_name,
+            }
+            joblib.dump(meta, os.path.join(tmp_dir, f"meta_{horizon}.pkl"))
 
             if result.get("is_lstm"):
                 lstm_path = os.path.join(
                     tmp_dir, f"lstm_model_{horizon}.keras")
                 result["model"].save(lstm_path)
-                joblib.dump({"type": "lstm",
-                             "path": f"lstm_model_{horizon}.keras"},
-                            model_fname)
+                joblib.dump(
+                    {"type": "lstm",
+                     "path": f"lstm_model_{horizon}.keras"},
+                    model_fname)
             else:
                 joblib.dump(result["model"], model_fname)
 
             joblib.dump(result["scaler"], scaler_fname)
-            joblib.dump(monthly_stats,    stats_fname)
 
             model_name = f"aqi_model_{horizon}"
             try:
@@ -328,62 +500,87 @@ def save_models(horizon_results, project, monthly_stats):
             model_obj = mr.python.create_model(
                 name=model_name,
                 version=version,
-                metrics=dict(rmse=round(result["rmse"], 3),
-                             mae=round(result["mae"],  3),
-                             r2=round(result["r2"],   3)),
-                description=(f"{best_name} — Karachi AQI {horizon} "
-                             f"(deseasonalized, forecast features)")
+                metrics=dict(
+                    rmse=round(result["rmse"], 3),
+                    mae=round(result["mae"],  3),
+                    r2=round(result["r2"],   3),
+                    r2_diff=round(result["r2_diff"], 3),
+                ),
+                description=(
+                    f"{best_name} — Karachi AQI {horizon} "
+                    f"(differenced-target, v6)"
+                )
             )
             model_obj.save(tmp_dir)
             print(f"  Saved aqi_model_{horizon} v{version}  "
-                  f"R²={result['r2']:.3f}")
+                  f"R²={result['r2']:.3f}  R²_diff={result['r2_diff']:.3f}")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    print("=== Training Pipeline v4 ===\n")
-    df, project = load_features()
+    print("=== Training Pipeline v6 ===\n")
 
-    print(f"Date range: {df['timestamp'].min()} to "
-          f"{df['timestamp'].max()}")
-    print(f"AQI range: {df['aqi'].min()} to {df['aqi'].max()}  "
+    df, project = load_features()
+    df = parse_timestamps(df)
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    print(f"Date range: {df['timestamp'].min()} → {df['timestamp'].max()}")
+    print(f"AQI range:  {df['aqi'].min()} to {df['aqi'].max()}  "
           f"mean={df['aqi'].mean():.1f}")
 
-    if "target_1h" not in df.columns:
-        print("\n  [INFO] Computing target_1h from aqi column.")
-        df = df.sort_values("timestamp").copy()
-        df["target_1h"] = df["aqi"].shift(-1)
+    # Compute rolling trend (kept as a feature, not used for deseasonalisation)
+    df = compute_trend(df)
 
-    df, monthly_stats = add_seasonal_features(df)
-    print("\n  Monthly AQI stats:")
-    print(monthly_stats.to_string(index=False))
+    # Verify all expected features are present
+    missing_from_schema = [f for f in FEATURES if f not in df.columns]
+    if missing_from_schema:
+        print(f"\n  [WARN] These FEATURES are absent from the feature group:")
+        for f in missing_from_schema:
+            print(f"    {f}")
+        print("  Run backfill_pipeline.py to regenerate with v6 schema.")
+    else:
+        print(f"\n  All {len(FEATURES)} features present ✓")
+
+    # Build differenced targets
+    df = build_diff_targets(df)
 
     horizon_results = {}
-    print("\n── Training models ────────────────────────")
+    print("\n── Training models ─────────────────────────────")
 
-    for target in TARGETS:
-        horizon = target.replace("target_", "")
-        if target not in df.columns:
-            print(f"Skipping {target} — not in feature store")
+    for horizon, (raw_col, diff_col) in HORIZONS.items():
+        if raw_col not in df.columns:
+            print(f"\n  Skipping {horizon} — {raw_col} not found")
+            continue
+        if diff_col not in df.columns:
+            print(f"\n  Skipping {horizon} — {diff_col} not built")
             continue
 
-        corr = df["aqi"].corr(df[target])
-        print(f"\n  {horizon}  corr(aqi,target)={corr:.3f}")
+        corr_raw  = df["aqi"].corr(df[raw_col].dropna())
+        corr_diff = df["aqi"].corr(df[diff_col].dropna())
+        print(f"\n  {horizon}  corr(aqi, raw_target)={corr_raw:.3f}  "
+              f"corr(aqi, diff_target)={corr_diff:.3f}")
 
-        X_train, X_test, y_train, y_test, y_test_raw, available = \
-            prepare_data(df, target, monthly_stats)
+        (X_train, X_test,
+         y_train, y_test,
+         y_test_raw, aqi_test, available) = prepare_data(
+            df, raw_col, diff_col)
 
         result, best_name = train_models(
-            X_train, X_test, y_train, y_test,
-            y_test_raw, horizon, monthly_stats)
+            X_train, X_test,
+            y_train, y_test,
+            y_test_raw, aqi_test, horizon)
+
         horizon_results[horizon] = (result, best_name)
 
-    print("\n── Summary ────────────────────────────────")
+    print("\n── Summary ─────────────────────────────────────")
+    print(f"  {'Horizon':8s}  {'Model':22s}  {'RMSE':>8}  "
+          f"{'R²':>7}  {'R²_diff':>8}")
+    print(f"  {'-'*8}  {'-'*22}  {'-'*8}  {'-'*7}  {'-'*8}")
     for h, (r, name) in horizon_results.items():
-        print(f"  {h:6s}  {name:15s}  "
-              f"RMSE={r['rmse']:.2f}  R²={r['r2']:.3f}")
+        print(f"  {h:8s}  {name:22s}  {r['rmse']:8.2f}  "
+              f"{r['r2']:7.3f}  {r['r2_diff']:8.3f}")
 
-    print("\n── Saving to Hopsworks ────────────────────")
-    save_models(horizon_results, project, monthly_stats)
+    print("\n── Saving to Hopsworks ─────────────────────────")
+    save_models(horizon_results, project)
     print("\n=== Training Pipeline Complete ===")
