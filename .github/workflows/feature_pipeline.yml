@@ -1,37 +1,27 @@
 # .github/workflows/feature_pipeline.yml
 #
-# Runs every hour. Two trigger mechanisms work together:
-#
-#   1. schedule (cron): GitHub's built-in scheduler. Free-tier repos often
-#      experience 15-60 min delays and GitHub silently disables schedules
-#      after 60 days of repo inactivity. Keep this as a fallback.
-#
-#   2. workflow_dispatch: Allows an external service to trigger this workflow
-#      instantly via the GitHub API. Set up cron-job.org to call the dispatch
-#      URL every hour — this guarantees on-time execution regardless of
-#      GitHub queue pressure.
+# Triggered exclusively by cron-job.org via workflow_dispatch.
+# No schedule block — cron-job.org is the sole trigger to guarantee
+# on-time execution (GitHub's native cron delays by 15-60 min on free tier).
 #
 # HOW TO SET UP cron-job.org (one-time):
-#   a) Go to https://cron-job.org and create a free account.
-#   b) Create a new cron job with:
-#        URL:    https://api.github.com/repos/YOUR_USERNAME/YOUR_REPO/actions/workflows/feature_pipeline.yml/dispatches
-#        Method: POST
-#        Headers:
-#          Accept: application/vnd.github+json
-#          Authorization: Bearer YOUR_GITHUB_PAT
-#          Content-Type: application/json
-#        Body:   {"ref":"main"}
-#        Schedule: every hour (e.g. 0 * * * *)
-#   c) YOUR_GITHUB_PAT must have the 'repo' scope (Actions write permission).
-#      Generate it at: GitHub → Settings → Developer settings → Personal access tokens
-#   d) Keep the schedule cron below as a fallback in case cron-job.org is down.
+#   1. Go to https://cron-job.org, create a free account
+#   2. Create a new cron job:
+#        URL:     https://api.github.com/repos/YOUR_USERNAME/YOUR_REPO/actions/workflows/feature_pipeline.yml/dispatches
+#        Method:  POST
+#        Headers: Accept: application/vnd.github+json
+#                 Authorization: Bearer YOUR_GITHUB_PAT
+#                 Content-Type: application/json
+#        Body:    {"ref":"main"}
+#        Schedule: every hour (0 * * * *)
+#   3. Generate YOUR_GITHUB_PAT at:
+#        GitHub → Settings → Developer settings → Personal access tokens
+#        Scope required: repo (Actions write)
 
 name: Feature Pipeline (hourly)
 
 on:
-  schedule:
-    - cron: "0 * * * *"    # fallback: GitHub's own scheduler (may be delayed)
-  workflow_dispatch:         # primary: triggered on-time by cron-job.org
+  workflow_dispatch:
 
 jobs:
   run:
@@ -44,11 +34,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-          cache: "pip"         # caches pip packages between runs (faster installs)
+          # No cache: "pip" here — we install packages directly,
+          # not from a requirements.txt, so the cache lookup would fail.
 
       - name: Install dependencies
-        # tensorflow excluded here — feature pipeline does not need it.
-        # This keeps the install fast (~30s vs ~3min with tensorflow).
+        # tensorflow excluded — feature pipeline does not use it.
+        # Keeps install time ~30s instead of ~3min.
         run: |
           pip install \
             "numpy>=1.26,<3" \
@@ -62,5 +53,5 @@ jobs:
       - name: Run feature pipeline
         run: python pipelines/feature_pipeline.py
         env:
-          HOPSWORKS_API_KEY:  ${{ secrets.HOPSWORKS_API_KEY }}
-          HOPSWORKS_PROJECT:  ${{ secrets.HOPSWORKS_PROJECT }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}

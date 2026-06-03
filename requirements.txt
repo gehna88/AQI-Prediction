@@ -1,0 +1,27 @@
+# ── Core data ────────────────────────────────────────────────────────
+numpy>=1.26,<3
+pandas>=2.1,<3
+pyarrow>=14.0          # required by hopsworks offline engine
+
+# ── HTTP ─────────────────────────────────────────────────────────────
+requests>=2.31
+
+# ── Feature store ────────────────────────────────────────────────────
+# Pin to 4.7.* to match the Hopsworks backend version (4.7.2).
+# Do NOT upgrade to 4.8.x until the backend is also upgraded.
+hopsworks==4.7.*
+confluent-kafka>=2.3   # required by hopsworks 4.7 for all fg.insert() calls
+
+# ── ML ───────────────────────────────────────────────────────────────
+scikit-learn>=1.4,<2
+xgboost>=2.0,<4
+joblib>=1.3
+
+# ── Deep learning (training pipeline only) ───────────────────────────
+# tensorflow is large (~600MB). The feature pipeline does not need it.
+# If you want a lighter feature_pipeline.yml, remove this line and
+# keep it only in training_pipeline.yml's install step.
+tensorflow>=2.15,<3
+
+# ── Environment ──────────────────────────────────────────────────────
+python-dotenv>=1.0

@@ -1,3 +1,12 @@
+# .github/workflows/training_pipeline.yml
+#
+# Runs once daily at 02:00 UTC via GitHub's native cron scheduler.
+# Daily granularity means a 30-minute queue delay is irrelevant,
+# so cron-job.org is not needed here.
+#
+# requirements.txt must be committed to the REPO ROOT for pip cache to work.
+# Place it at: your-repo/requirements.txt (not inside a subfolder).
+
 name: Training Pipeline (daily)
 
 on:
@@ -8,15 +17,21 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          # cache: "pip" requires requirements.txt in the repo root.
+          # Only uncomment this after you have committed requirements.txt.
+          # cache: "pip"
 
       - name: Install dependencies
-        run: pip install requests pandas numpy python-dotenv hopsworks==4.7.* pyarrow confluent-kafka scikit-learn xgboost joblib tensorflow
+        run: pip install -r requirements.txt
 
       - name: Run training pipeline
         run: python pipelines/training_pipeline.py

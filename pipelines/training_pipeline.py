@@ -296,7 +296,7 @@ def tune_ridge_alpha(X_train, y_train):
             best_score = mean_score
             best_alpha = alpha
 
-    scores_str = "  ".join(f"α={a}:{s:+.3f}" for a, s in alpha_scores.items())
+    scores_str = "  ".join(f"a={a}:{s:+.3f}" for a, s in alpha_scores.items())
     print(f"    Ridge CV: {scores_str}")
     print(f"    Ridge CV best alpha={best_alpha}  CV R²={best_score:.3f}")
     return best_alpha
@@ -356,7 +356,7 @@ def train_models(X_train, X_test,
     ridge      = Ridge(alpha=best_alpha)
 
     candidates = {
-        f"Ridge(α={best_alpha})": (ridge, True),
+        f"Ridge(a={best_alpha})": (ridge, True),
         "RandomForest": (RandomForestRegressor(
             n_estimators=500,
             max_depth=12,        # compromise between v5's 10 and suggested 15
@@ -497,6 +497,11 @@ def save_models(horizon_results, project):
             except Exception:
                 version = 1
 
+            # Hopsworks stores description in a MySQL column that rejects
+            # multi-byte UTF-8 characters (e.g. the Greek α in "Ridge(α=500)").
+            # Replace any non-ASCII characters with ASCII equivalents first.
+            safe_name = best_name.encode("ascii", errors="replace").decode("ascii")
+            safe_name = safe_name.replace("?", "a")  # α → ? → a
             model_obj = mr.python.create_model(
                 name=model_name,
                 version=version,
@@ -507,7 +512,7 @@ def save_models(horizon_results, project):
                     r2_diff=round(result["r2_diff"], 3),
                 ),
                 description=(
-                    f"{best_name} — Karachi AQI {horizon} "
+                    f"{safe_name} -- Karachi AQI {horizon} "
                     f"(differenced-target, v6)"
                 )
             )
