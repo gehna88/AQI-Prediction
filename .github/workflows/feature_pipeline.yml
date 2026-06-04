@@ -53,5 +53,6 @@ jobs:
       - name: Run feature pipeline
         run: python pipelines/feature_pipeline.py
         env:
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
+          HOPSWORKS_API_KEY:    ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT:    ${{ secrets.HOPSWORKS_PROJECT }}
+          OPENWEATHER_API_KEY:  ${{ secrets.OPENWEATHER_API_KEY }}

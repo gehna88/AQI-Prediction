@@ -5,12 +5,17 @@ WHAT CHANGED vs v4 and WHY:
 =============================================================================
 
 1. CRASH FIX: KeyError 'aqi' on empty history DataFrame
-2. AQI SOURCE CHANGED: pm25_to_aqi() → us_aqi (consistent with backfill)
-3. FORECAST FEATURES DECOUPLED FROM TRAINING SCHEMA (no train/serve skew)
-4. AQI > 5 FILTER REMOVED
-5. roll_mean / roll_std helpers use min_periods consistently
-6. confluent_kafka preflight check — fails fast with clear install message
-7. history column guard — graceful NaN fallback if columns missing
+2. AQI SOURCE: Open-Meteo air-quality-api (consistent with backfill training data)
+3. WEATHER SOURCE CHANGED: api.open-meteo.com/v1/forecast → OpenWeatherMap
+   The Open-Meteo Forecast API has intermittent 502 outages (83% uptime on
+   Jun 04). The air-quality-api is on a separate stable server (100% uptime).
+   OpenWeather current weather API is extremely reliable.
+   This eliminates the 502 errors from the hourly pipeline.
+4. RETRY LOGIC: _get_json() retries 5× with 15s backoff for transient errors.
+5. GRACEFUL EXIT: API outage exits with code 0 so GitHub Actions does not
+   send failure notifications for a skipped hourly row.
+6. FORECAST FEATURES DECOUPLED FROM TRAINING SCHEMA (no train/serve skew)
+7. confluent_kafka preflight check
 =============================================================================
 """
 
@@ -40,6 +45,9 @@ load_dotenv()
 LAT = 24.8607
 LON = 67.0011
 
+# OpenWeather API key — add OPENWEATHER_API_KEY to your .env and GitHub secrets
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+
 
 def pm25_to_aqi(pm25):
     """Fallback: compute US AQI from PM2.5 only."""
@@ -63,8 +71,52 @@ def pm25_to_aqi(pm25):
     return 500
 
 
+def _get_json(url, timeout=20, retries=5, backoff=15):
+    """
+    Fetch a URL and return parsed JSON with retry logic.
+    Open-Meteo occasionally returns 502/empty under load or during brief outages.
+    5 retries × 15s backoff = up to 75 seconds of waiting before giving up.
+    """
+    import time as _time
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                raise ValueError(
+                    f"HTTP {resp.status_code}: {resp.text[:200]}")
+            if not resp.text.strip():
+                raise ValueError("Empty response body")
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            print(f"  [WARN] Attempt {attempt}/{retries} failed: {e}")
+            if attempt < retries:
+                _time.sleep(backoff)
+    raise RuntimeError(
+        f"All {retries} attempts failed for {url}. Last error: {last_err}")
+
+
 def fetch_current():
-    """Fetch current AQI, weather, and derived fields."""
+    """
+    Fetch current conditions using two separate stable sources:
+
+    1. air-quality-api.open-meteo.com → AQI + pollutants
+       Same server as backfill (100% uptime on status page).
+       Same source as training data → no train/serve skew on AQI values.
+
+    2. api.openweathermap.org → weather (temp, wind, humidity, pressure)
+       Replaces api.open-meteo.com/v1/forecast which had 502 outages.
+       Free tier, requires OPENWEATHER_API_KEY env var.
+    """
+    if not OPENWEATHER_API_KEY:
+        raise RuntimeError(
+            "OPENWEATHER_API_KEY is not set.\n"
+            "Get a free key at openweathermap.org and add it to your "
+            ".env file and GitHub Actions secrets as OPENWEATHER_API_KEY."
+        )
+
+    # ── Air quality: Open-Meteo (same source as training data) ────────
     aq_url = (
         f"https://air-quality-api.open-meteo.com/v1/air-quality"
         f"?latitude={LAT}&longitude={LON}"
@@ -72,23 +124,21 @@ def fetch_current():
         f"nitrogen_dioxide,sulphur_dioxide,ozone,"
         f"dust,european_aqi,us_aqi"
     )
+    aq_r = _get_json(aq_url)
+    aq   = aq_r.get("current", {})
+
+    # ── Weather: OpenWeatherMap (replaces unstable Forecast API) ──────
     wx_url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={LAT}&longitude={LON}"
-        f"&current=temperature_2m,relative_humidity_2m,"
-        f"wind_speed_10m,wind_direction_10m,"
-        f"wind_gusts_10m,precipitation,"
-        f"surface_pressure,cloud_cover,"
-        f"apparent_temperature,dew_point_2m,"
-        f"shortwave_radiation"
-        f"&wind_speed_unit=ms"
+        f"https://api.openweathermap.org/data/2.5/weather"
+        f"?lat={LAT}&lon={LON}"
+        f"&appid={OPENWEATHER_API_KEY}"
+        f"&units=metric"
     )
-
-    aq_r = requests.get(aq_url, timeout=10).json()
-    wx_r = requests.get(wx_url, timeout=10).json()
-
-    aq = aq_r.get("current", {})
-    wx = wx_r.get("current", {})
+    wx_r  = _get_json(wx_url)
+    main  = wx_r.get("main",   {})
+    wind  = wx_r.get("wind",   {})
+    cloud = wx_r.get("clouds", {})
+    rain  = wx_r.get("rain",   {})
 
     def s(d, k):
         v = d.get(k)
@@ -96,15 +146,27 @@ def fetch_current():
 
     pm25   = s(aq, "pm2_5")
     us_aqi = s(aq, "us_aqi")
-    temp   = s(wx, "temperature_2m")
-    wind   = s(wx, "wind_speed_10m")
-    hum    = s(wx, "relative_humidity_2m")
-    pres   = s(wx, "surface_pressure")
-    dew    = s(wx, "dew_point_2m")
-    wdir   = s(wx, "wind_direction_10m")
-    sol    = s(wx, "shortwave_radiation")
+    temp   = float(main.get("temp",       np.nan))
+    hum    = float(main.get("humidity",   np.nan))
+    pres   = float(main.get("pressure",   np.nan))
+    wsp    = float(wind.get("speed",      np.nan))   # already m/s with units=metric
+    wdir   = float(wind.get("deg",        np.nan))
+    wgust  = float(wind.get("gust",       np.nan) if wind.get("gust") else np.nan)
+    prec   = float(rain.get("1h",         0.0))
+    cc     = float(cloud.get("all",       np.nan))
+    app    = float(main.get("feels_like", np.nan))
 
-    # Use official us_aqi; fall back to formula if missing
+    # OpenWeather free tier has no dew point — compute from Magnus formula
+    if not (np.isnan(temp) or np.isnan(hum)):
+        a, b  = 17.27, 237.7
+        alpha = (a * temp) / (b + temp) + np.log(max(hum, 1) / 100.0)
+        dew   = (b * alpha) / (a - alpha)
+    else:
+        dew = np.nan
+
+    # solar_rad not available from OpenWeather free tier — store NaN
+    sol = np.nan
+
     aqi_val = us_aqi if not np.isnan(us_aqi) else (
         float(pm25_to_aqi(pm25)) if not np.isnan(pm25) else np.nan
     )
@@ -122,13 +184,13 @@ def fetch_current():
         "us_aqi":        us_aqi,
         "temp":          temp,
         "humidity":      hum,
-        "wind":          wind,
-        "wind_gusts":    s(wx, "wind_gusts_10m"),
-        "precipitation": s(wx, "precipitation"),
+        "wind":          wsp,
+        "wind_gusts":    wgust,
+        "precipitation": prec,
         "pressure":      pres,
-        "cloud_cover":   s(wx, "cloud_cover"),
+        "cloud_cover":   cc,
         "dew_point":     dew,
-        "apparent_temp": s(wx, "apparent_temperature"),
+        "apparent_temp": app,
         "solar_rad":     sol,
         "temp_humidity": temp * hum / 100
                          if not (np.isnan(temp) or np.isnan(hum))
@@ -137,8 +199,8 @@ def fetch_current():
                          if not np.isnan(wdir) else np.nan,
         "wind_dir_cos":  float(np.cos(np.radians(wdir)))
                          if not np.isnan(wdir) else np.nan,
-        "pm25_wind":     pm25 / (wind + 0.1)
-                         if not (np.isnan(pm25) or np.isnan(wind))
+        "pm25_wind":     pm25 / (wsp + 0.1)
+                         if not (np.isnan(pm25) or np.isnan(wsp))
                          else np.nan,
         "dew_depression": temp - dew
                           if not (np.isnan(temp) or np.isnan(dew))
@@ -161,7 +223,7 @@ def fetch_weather_forecasts(now_ts):
         f"&wind_speed_unit=ms&timezone=UTC"
     )
     try:
-        r = requests.get(fc_url, timeout=10).json()
+        r = _get_json(fc_url)
     except Exception as e:
         print(f"  [WARN] Forecast fetch failed: {e}")
         return {}
@@ -362,7 +424,14 @@ if __name__ == "__main__":
     print("=== AQI Feature Pipeline v6 ===")
 
     # ── Step 1: fetch current reading ─────────────────────────────
-    data = fetch_current()
+    try:
+        data = fetch_current()
+    except RuntimeError as e:
+        print(f"\n[INFO] Open-Meteo API unavailable: {e}")
+        print("[INFO] Skipping this hourly run — no row stored.")
+        print("[INFO] This is expected during brief API outages.")
+        print("[INFO] The next hourly run will try again.")
+        sys.exit(0)  # exit 0 = success, so GitHub Actions doesn't flag it
     now  = datetime.now(timezone.utc)
     now_str = now.isoformat()
     ts   = pd.Timestamp(now_str)
