@@ -412,8 +412,9 @@ def store_features(df, project):
         name="aqi_features",
         version=1,
         primary_key=["timestamp"],
+        event_time="timestamp",
         description="Hourly AQI features Karachi — v6 (extended lags, no forecast cols)",
-        online_enabled=False,
+        online_enabled=True,
     )
     fg.insert(df, write_options={"wait_for_job": True})
     # wait_for_job=True: block until the offline Spark materialization job

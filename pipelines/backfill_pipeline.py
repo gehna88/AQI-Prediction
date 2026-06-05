@@ -101,6 +101,29 @@ def pm25_to_aqi(pm25):
     return 500
 
 
+def _get_json(url, timeout=30, retries=3, backoff=5):
+    """
+    Fetch a URL and return parsed JSON with retry logic.
+    Open-Meteo occasionally returns empty responses under load.
+    """
+    import time as _time
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                raise ValueError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            if not resp.text.strip():
+                raise ValueError("Empty response body")
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                print(f"    [retry {attempt}/{retries}] {e}")
+                _time.sleep(backoff)
+    raise RuntimeError(f"All {retries} attempts failed: {last_err}")
+
+
 def fetch_chunk(start_date, end_date):
     """
     Fetch one chunk of air quality + weather data from Open-Meteo.
@@ -132,8 +155,8 @@ def fetch_chunk(start_date, end_date):
     )
 
     try:
-        aq_r = requests.get(aq_url, timeout=30).json()
-        wx_r = requests.get(wx_url, timeout=30).json()
+        aq_r = _get_json(aq_url)
+        wx_r = _get_json(wx_url)
     except Exception as e:
         print(f"\n  Request failed: {e}")
         return []
@@ -358,6 +381,7 @@ def store_features(df):
         needs_migration = bool(
             (existing_cols & STALE_FORECAST_COLS)   # old v4 forecast schema
             or (NEW_V6_COLS - existing_cols)          # missing v6 lag/roll cols
+            or not existing_fg.online_enabled         # must be online_enabled=True
         )
         if needs_migration:
             print("  [MIGRATE] Schema is outdated — deleting to apply v6 schema...")
@@ -372,24 +396,34 @@ def store_features(df):
         name="aqi_features",
         version=1,
         primary_key=["timestamp"],
+        event_time="timestamp",
         description="Hourly AQI features Karachi — v6 (extended lags, no forecast cols)",
-        online_enabled=False,
+        online_enabled=True,
     )
 
-    # write_options={} uses the offline Python/Arrow engine — no Kafka needed.
-    fg.insert(df, write_options={})
+    fg.insert(df, write_options={"wait_for_job": True})
     print(f"Upserted {len(df)} rows × {len(df.columns)} columns → Hopsworks")
 
 
 if __name__ == "__main__":
     print("=== Backfill Pipeline v6 ===\n")
 
-    # ── Cap backfill at 90 days (Open-Meteo archive-api limit) ────
+    # ── 180-day backfill window ───────────────────────────────────────
+    # Both Open-Meteo APIs support this:
+    #   archive-api.open-meteo.com  — ERA5 reanalysis, available from 1940
+    #   air-quality-api.open-meteo.com — CAMS reanalysis, available from 2013
+    # The previous 90-day cap was unnecessarily conservative.
+    #
+    # 180 days gives ~4080 training rows (after lag/target engineering),
+    # 2.1× more than 90 days, and crucially covers BOTH the high-AQI
+    # Karachi winter (Dec-Feb, AQI ~120-140) and the lower pre-monsoon
+    # spring (Apr-Jun, AQI ~75-90). This directly fixes the distribution
+    # shift that caused negative R² at 48h/72h.
     today      = datetime.now(timezone.utc)
-    start      = today - timedelta(days=90)
+    start      = today - timedelta(days=180)
     chunk_days = 30
 
-    print(f"Backfill window: {start.date()} → {today.date()} (90 days)\n")
+    print(f"Backfill window: {start.date()} → {today.date()} (180 days)\n")
 
     all_rows = []
     cur = start
