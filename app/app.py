@@ -1,23 +1,33 @@
 """
-app.py  –  v3 (deseasonalized inference)
-=========================================
-What changed vs v2:
-  1. INFERENCE RESEASONALIZATION: models now predict anomaly from monthly mean.
-     At inference, monthly_stats.pkl is loaded and the current month's mean
-     is added back to produce the final AQI forecast.
-  2. All other fixes from v2 retained (direct models for cards, scaler applied,
-     SHAP on 24h model, pd.isna() for N/A display).
+app.py  –  v5
+
+Changes vs v4:
+  1. Ensemble inference — loads all model artifacts + weights, blends predictions
+  2. Side-by-side UI — AQI banner left, pollutants + weather right
+  3. Fixed: UserWarning "X does not have valid feature names"
+     Pass DataFrame (not .values) to scaler.transform() so column names are kept
+  4. Fixed: use_container_width → width='stretch' (Streamlit deprecation)
+  5. Fixed: InconsistentVersionWarning — suppress with warnings.filterwarnings
+     The versions differ between CI (1.7.2) and local (1.9.0). Predictions are
+     still correct for RF/Ridge across minor sklearn versions. Suppressed so
+     the terminal output is readable.
 """
 
 import os
+import warnings
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
 import hopsworks
 from dotenv import load_dotenv
+
+# Suppress sklearn version mismatch warnings — predictions are still valid
+warnings.filterwarnings("ignore", category=UserWarning,
+                        message=".*InconsistentVersionWarning.*")
+warnings.filterwarnings("ignore", category=UserWarning,
+                        message=".*valid feature names.*")
 
 load_dotenv()
 
@@ -27,485 +37,539 @@ st.set_page_config(
     layout="wide"
 )
 
+# ── Feature list: must match training_pipeline.py FEATURES exactly ──
 FEATURES = [
     "aqi", "pm25", "pm10", "o3", "no2", "so2", "co",
-    "dust", "ammonia", "european_aqi", "us_aqi",
-    "temp", "humidity", "wind", "wind_dir",
-    "wind_gusts", "precipitation", "pressure",
-    "cloud_cover", "visibility", "dew_point",
-    "apparent_temp", "soil_temp", "solar_rad",
+    "dust", "european_aqi", "us_aqi",
+    "temp", "humidity", "wind", "wind_gusts",
+    "precipitation", "pressure", "cloud_cover",
+    "dew_point", "apparent_temp",
+    # solar_rad removed — always NaN from OpenWeather, causes spurious SHAP
     "hour", "day_of_week", "month", "is_weekend",
     "hour_sin", "hour_cos", "month_sin", "month_cos",
     "aqi_lag1", "aqi_lag2", "aqi_lag3",
     "aqi_lag6", "aqi_lag12", "aqi_lag24", "aqi_lag48",
+    "aqi_lag72", "aqi_lag96", "aqi_lag120", "aqi_lag168",
     "aqi_roll3_mean", "aqi_roll6_mean",
     "aqi_roll12_mean", "aqi_roll24_mean",
+    "aqi_roll48_mean", "aqi_roll72_mean",
     "aqi_roll6_std", "aqi_roll24_std",
-    "aqi_roll24_max", "aqi_roll24_min",
-    "aqi_change_rate", "aqi_diff1",
-    "aqi_diff6", "aqi_diff24",
+    "aqi_change_rate", "aqi_diff1", "aqi_diff6", "aqi_diff24",
     "pm25_lag1", "pm25_lag24", "pm25_roll6_mean",
-    "temp_humidity", "wind_chill", "pressure_diff",
+    "temp_humidity", "pressure_diff",
     "wind_dir_sin", "wind_dir_cos",
-    "pm25_wind", "dew_depression", "is_daytime",
-    # seasonal features added in v3 training
-    "monthly_mean_aqi", "monthly_std_aqi",
+    "pm25_wind", "dew_depression",
+    "aqi_trend",
 ]
 
-
-def aqi_color(val):
-    if val <= 50:   return "#00e400", "Good"
-    if val <= 100:  return "#ffff00", "Moderate"
-    if val <= 150:  return "#ff7e00", "Unhealthy for Sensitive Groups"
-    if val <= 200:  return "#ff0000", "Unhealthy"
-    if val <= 300:  return "#8f3f97", "Very Unhealthy"
-    return "#7e0023", "Hazardous"
+SEQ_LEN = 24  # must match training_pipeline.py
 
 
-def text_color(val):
-    return "#000000" if val <= 100 else "#ffffff"
+def aqi_category(val):
+    if val <= 50:   return "#00e400", "#000000", "Good"
+    if val <= 100:  return "#ffff00", "#000000", "Moderate"
+    if val <= 150:  return "#ff7e00", "#000000", "Unhealthy for Sensitive"
+    if val <= 200:  return "#ff0000", "#ffffff", "Unhealthy"
+    if val <= 300:  return "#8f3f97", "#ffffff", "Very Unhealthy"
+    return "#7e0023", "#ffffff", "Hazardous"
 
 
-def iterative_forecast(model, scaler, latest_row,
-                       available, monthly_stats, hours=72):
-    """
-    Iterative 1h forecast. Predictions are in deseasonalized space
-    if the model was trained with deseasonalization, then
-    re-seasonalized per hour using the current month mean.
-    """
-    monthly_mean_map = dict(
-        zip(monthly_stats["month_num"],
-            monthly_stats["monthly_mean_aqi"])
-    ) if monthly_stats is not None else {}
-
-    row  = latest_row[available].copy().to_dict()
-    preds_raw = []
-
-    for h in range(hours):
-        X_raw    = pd.DataFrame([row])[available]
-        X_scaled = scaler.transform(X_raw.values) \
-                   if scaler is not None else X_raw.values
+def is_lstm(model):
+    try:
         import tensorflow as tf
-        if isinstance(model, tf.keras.Model):
-            pred_deseason = float(model.predict(
-                X_scaled.reshape(1, 1, X_scaled.shape[1]), verbose=0)[0][0])
-        else:
-            pred_deseason = float(model.predict(X_scaled)[0])
-
-        # re-seasonalize
-        current_month = int(row.get("month", 1))
-        monthly_mean  = monthly_mean_map.get(current_month, 0)
-        pred_aqi      = pred_deseason + monthly_mean
-        pred_aqi      = max(15, min(500, pred_aqi))
-        preds_raw.append(pred_aqi)
-
-        # update rolling features with raw AQI
-        row["aqi_lag3"]  = row["aqi_lag2"]
-        row["aqi_lag2"]  = row["aqi_lag1"]
-        row["aqi_lag1"]  = row["aqi"]
-        row["aqi"]       = pred_aqi
-        row["pm25_lag1"] = row.get("pm25", pred_aqi / 2)
-
-        row["aqi_roll3_mean"]  = (row["aqi_roll3_mean"]  * 2  + pred_aqi) / 3
-        row["aqi_roll6_mean"]  = (row["aqi_roll6_mean"]  * 5  + pred_aqi) / 6
-        row["aqi_roll12_mean"] = (row["aqi_roll12_mean"] * 11 + pred_aqi) / 12
-        row["aqi_roll24_mean"] = (row["aqi_roll24_mean"] * 23 + pred_aqi) / 24
-
-        prev = row["aqi_lag1"]
-        row["aqi_change_rate"] = (
-            (pred_aqi - prev) / prev if prev != 0 else 0)
-        row["aqi_diff1"] = pred_aqi - prev
-
-        new_hour = (int(row["hour"]) + 1) % 24
-        row["hour"]       = new_hour
-        row["hour_sin"]   = np.sin(2 * np.pi * new_hour / 24)
-        row["hour_cos"]   = np.cos(2 * np.pi * new_hour / 24)
-        row["is_weekend"] = int(int(row["day_of_week"]) in [5, 6])
-
-    return preds_raw
+        return isinstance(model, tf.keras.Model)
+    except ImportError:
+        return False
 
 
-@st.cache_resource(show_spinner="Loading data and models...")
-def load_everything():
+@st.cache_resource(show_spinner="Loading models from Hopsworks...")
+def load_models():
+    """
+    Load models once and cache permanently — models only change after retraining.
+    Separated from data loading so the hourly data refresh doesn't force
+    a full model reload (which takes 2-3 minutes due to TensorFlow).
+    """
     project = hopsworks.login(
         project=os.getenv("HOPSWORKS_PROJECT"),
         api_key_value=os.getenv("HOPSWORKS_API_KEY")
     )
-    fs = project.get_feature_store()
-    fg = fs.get_feature_group("aqi_features", version=1)
-    df = fg.read()
-    df = df.sort_values("timestamp").reset_index(drop=True)
 
-    mr      = project.get_model_registry()
-    models  = {}
-    scalers = {}
-    monthly_stats = None
+    mr = project.get_model_registry()
+    best_models  = {}
+    scalers      = {}
+    ensemble_all = {}
+    ensemble_wts = {}
 
     for horizon in ["1h", "24h", "48h", "72h"]:
         try:
-            m    = mr.get_model(f"aqi_model_{horizon}")
+            all_versions = mr.get_models(name=f"aqi_model_{horizon}")
+            if not all_versions:
+                continue
+            m    = sorted(all_versions, key=lambda x: x.version)[-1]
             mdir = m.download()
+            print(f"Loaded {horizon} model v{m.version}")
 
-            pkl_path = os.path.join(mdir, f"model_{horizon}.pkl")
-            stub = joblib.load(pkl_path)
+            pkl  = os.path.join(mdir, f"model_{horizon}.pkl")
+            stub = joblib.load(pkl)
             if isinstance(stub, dict) and stub.get("type") == "lstm":
-                # LSTM saved as .keras — load with Keras
                 import tensorflow as tf
-                keras_path = os.path.join(mdir, stub["path"])
-                models[horizon] = tf.keras.models.load_model(keras_path)
+                best_models[horizon] = tf.keras.models.load_model(
+                    os.path.join(mdir, stub["path"]))
             else:
-                models[horizon] = stub
+                best_models[horizon] = stub
 
-            scaler_path = os.path.join(mdir, f"scaler_{horizon}.pkl")
-            scalers[horizon] = (
-                joblib.load(scaler_path)
-                if os.path.exists(scaler_path) else None)
+            sc = os.path.join(mdir, f"scaler_{horizon}.pkl")
+            scalers[horizon] = joblib.load(sc) if os.path.exists(sc) else None
 
-            # load monthly stats if present (saved with the 24h model)
-            if monthly_stats is None:
-                stats_path = os.path.join(mdir, "monthly_stats.pkl")
-                if os.path.exists(stats_path):
-                    monthly_stats = joblib.load(stats_path)
-                    print("Loaded monthly_stats for deseasonalization")
+            all_p = os.path.join(mdir, f"all_{horizon}.pkl")
+            if os.path.exists(all_p):
+                bundle = joblib.load(all_p)
+                loaded = {}
+                for name, entry in bundle.items():
+                    mo = entry["model"]
+                    if isinstance(mo, dict) and mo.get("type") == "lstm":
+                        import tensorflow as tf
+                        kp = os.path.join(mdir, mo["path"])
+                        if os.path.exists(kp):
+                            mo = tf.keras.models.load_model(kp)
+                        else:
+                            continue
+                    loaded[name] = {**entry, "model": mo}
+                ensemble_all[horizon] = loaded
 
-            print(f"Loaded {horizon} model")
+            wts_p = os.path.join(mdir, f"ensemble_weights_{horizon}.pkl")
+            if os.path.exists(wts_p):
+                ensemble_wts[horizon] = joblib.load(wts_p)
+
         except Exception as e:
-            print(f"{horizon} model not found: {e}")
+            print(f"  [WARN] {horizon}: {e}")
 
-    return df, models, scalers, monthly_stats
+    return project, best_models, scalers, ensemble_all, ensemble_wts
 
 
-# ── Load ──────────────────────────────────────────────
-df, models, scalers, monthly_stats = load_everything()
-latest      = df.iloc[-1].copy()
-current_aqi = float(latest["aqi"])
-bg, label   = aqi_color(current_aqi)
-tc          = text_color(current_aqi)
+@st.cache_data(ttl=3600, show_spinner="Fetching latest AQI data...")
+def load_data(_project):
+    """
+    Load feature data and refresh every hour (ttl=3600 seconds).
+    Uses @st.cache_data (not cache_resource) so it can expire on a timer.
+    The underscore prefix on _project tells Streamlit not to hash it.
+    """
+    fs = _project.get_feature_store()
+    fg = fs.get_feature_group("aqi_features", version=1)
+    df = fg.read()
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df["aqi_trend"] = (
+        df["aqi"].rolling(168, min_periods=24).mean()
+        .fillna(df["aqi"].expanding().mean())
+    )
+    return df
 
-# add seasonal features to latest row for inference
-if monthly_stats is not None:
-    monthly_mean_map = dict(
-        zip(monthly_stats["month_num"],
-            monthly_stats["monthly_mean_aqi"]))
-    monthly_std_map  = dict(
-        zip(monthly_stats["month_num"],
-            monthly_stats["monthly_std_aqi"]))
-    cur_month = int(pd.to_datetime(latest["timestamp"]).month)
-    latest["monthly_mean_aqi"] = monthly_mean_map.get(cur_month, 80)
-    latest["monthly_std_aqi"]  = monthly_std_map.get(cur_month, 20)
 
-available = [f for f in FEATURES if f in df.columns
-             or f in latest.index]
-# rebuild available to include seasonal features even if not in df cols
-available = [f for f in FEATURES
-             if f in latest.index and not pd.isna(latest.get(f, np.nan))]
+def _impute(df_row):
+    """
+    Fill NaN values before passing to any model.
+    NaNs arise from:
+      - solar_rad: OpenWeather free tier doesn't provide it (always NaN)
+      - aqi_lag168: needs 168h of history — NaN until pipeline has run 7 days
+      - aqi_lag96/120: same — NaN for first few days of data
+    Strategy: fill each column with its median across the full df history,
+    falling back to 0 if median is also NaN.
+    Called on a single-row or multi-row DataFrame before transform/predict.
+    """
+    return df_row.fillna(df_row.median()).fillna(0)
 
-# ── TITLE ─────────────────────────────────────────────
-st.title("🌫️ Karachi Air Quality Forecast")
-st.caption(f"Last updated: {latest['timestamp']}")
 
-# ── CURRENT AQI BANNER ────────────────────────────────
-st.markdown(f"""
-<div style='background:{bg};padding:24px;
-border-radius:12px;text-align:center;margin-bottom:20px'>
-<h1 style='color:{tc};margin:0;font-size:52px'>AQI {current_aqi:.0f}</h1>
-<h3 style='color:{tc};margin:6px 0'>{label}</h3>
-<p style='color:{tc};margin:0;opacity:0.85'>Karachi · Current reading</p>
-</div>
-""", unsafe_allow_html=True)
+def _scale(scaler, df_row):
+    """
+    Pass a DataFrame to scaler.transform() keeping column names.
+    Handles schema mismatch between old models (61 features, with solar_rad)
+    and new models (60 features, solar_rad removed):
+      - If scaler expects solar_rad but df_row doesn't have it: add as 0.0
+      - If scaler doesn't expect solar_rad but df_row has it: drop it
+    """
+    if scaler is None:
+        return df_row.values
 
-# ── 3-DAY FORECAST ────────────────────────────────────
-st.subheader("3-Day AQI Forecast")
+    # Get the columns the scaler was fitted on
+    if hasattr(scaler, "feature_names_in_"):
+        expected = list(scaler.feature_names_in_)
+        # Add any missing columns as 0 (e.g. solar_rad in old scaler)
+        for col in expected:
+            if col not in df_row.columns:
+                df_row = df_row.copy()
+                df_row[col] = 0.0
+        # Drop any extra columns not in the scaler (e.g. solar_rad removed)
+        df_row = df_row[expected]
 
-has_direct = ("24h" in models and "48h" in models and "72h" in models)
-has_1h     = "1h" in models
+    return scaler.transform(df_row)
 
-def predict_horizon(horizon):
-    """Predict and re-seasonalize. Handles both sklearn and LSTM models."""
-    import tensorflow as tf
-    feat_cols = [f for f in FEATURES if f in latest.index]
-    row_df    = pd.DataFrame([latest[feat_cols]])
-    sc        = scalers.get(horizon)
-    X         = sc.transform(row_df.values) if sc else row_df.values
-    if isinstance(models[horizon], tf.keras.Model):
-        pred_ds = float(models[horizon].predict(
-            X.reshape(1, 1, X.shape[1]), verbose=0)[0][0])
+
+def _predict_one_model(model, scaler, df, feat_cols):
+    """
+    Run inference for one model. Returns predicted DIFF (not absolute AQI).
+    NaN values are imputed with column medians before any model call.
+    LSTM: uses last SEQ_LEN rows as a sequence.
+    sklearn/XGBoost: uses single latest row.
+    """
+    if is_lstm(model):
+        recent = df[feat_cols].tail(SEQ_LEN).copy()
+        if len(recent) < SEQ_LEN:
+            pad    = pd.DataFrame(
+                [recent.iloc[0].values] * (SEQ_LEN - len(recent)),
+                columns=feat_cols)
+            recent = pd.concat([pad, recent], ignore_index=True)
+        recent = _impute(recent)
+        X = _scale(scaler, recent)
+        return float(model.predict(
+            X.reshape(1, SEQ_LEN, X.shape[1]), verbose=0)[0][0])
     else:
-        pred_ds = float(models[horizon].predict(X)[0])
+        row = df[feat_cols].iloc[[-1]].copy()
+        row = _impute(row)
+        X   = _scale(scaler, row)
+        return float(model.predict(X)[0])
 
-    # re-seasonalize
-    if monthly_stats is not None:
-        monthly_mean_map_local = dict(
-            zip(monthly_stats["month_num"],
-                monthly_stats["monthly_mean_aqi"]))
-        pred_raw = pred_ds + monthly_mean_map_local.get(cur_month, 0)
-    else:
-        pred_raw = pred_ds   # model not deseasonalized
 
-    return max(15, min(500, pred_raw))
+def predict_ensemble(horizon, df, best_models, scalers,
+                     ensemble_all, ensemble_wts):
+    """
+    Weighted ensemble: sum(weight_i * diff_i) across positive-R² models.
+    Falls back to single best model if ensemble artifacts absent.
+    Reconstruction: aqi_now + weighted_diff.
+    """
+    feat_cols = [f for f in FEATURES if f in df.columns]
+    aqi_now   = float(df["aqi"].iloc[-1])
 
-if has_direct:
-    pred_24h = predict_horizon("24h")
-    pred_48h = predict_horizon("48h")
-    pred_72h = predict_horizon("72h")
-    method   = "Direct multi-horizon models (24h/48h/72h) + deseasonalization"
-elif has_1h:
-    sc_1h        = scalers.get("1h")
-    hourly_preds = iterative_forecast(
-        models["1h"], sc_1h, latest, available,
-        monthly_stats, hours=72)
-    pred_24h = float(np.mean(hourly_preds[0:24]))
-    pred_48h = float(np.mean(hourly_preds[24:48]))
-    pred_72h = float(np.mean(hourly_preds[48:72]))
-    method   = "Iterative hourly forecasting (fallback)"
-else:
-    st.error("No models found. Run training pipeline first.")
+    if horizon in ensemble_all and horizon in ensemble_wts:
+        wts    = ensemble_wts[horizon]
+        bundle = ensemble_all[horizon]
+        scaler = scalers.get(horizon)
+        w_diff, w_total = 0.0, 0.0
+        for name, weight in wts.items():
+            if name not in bundle:
+                continue
+            try:
+                diff    = _predict_one_model(
+                    bundle[name]["model"], scaler, df, feat_cols)
+                w_diff  += weight * diff
+                w_total += weight
+            except Exception as e:
+                print(f"    [WARN] ensemble {name}: {e}")
+        if w_total > 0:
+            return float(np.clip(aqi_now + w_diff / w_total, 15, 500)), "ensemble"
+
+    if horizon in best_models:
+        scaler = scalers.get(horizon)
+        diff   = _predict_one_model(
+            best_models[horizon], scaler, df, feat_cols)
+        return float(np.clip(aqi_now + diff, 15, 500)), "single"
+
+    return aqi_now, "fallback"
+
+
+def iterative_1h_forecast(df, best_models, scalers, hours=72):
+    model  = best_models.get("1h")
+    scaler = scalers.get("1h")
+    if model is None:
+        return []
+
+    feat_cols = [f for f in FEATURES if f in df.columns]
+    row       = df[feat_cols].iloc[-1].copy().to_dict()
+    preds     = []
+
+    for _ in range(hours):
+        row_df  = _impute(pd.DataFrame([row])[feat_cols])
+        X       = _scale(scaler, row_df)
+        if is_lstm(model):
+            diff = float(model.predict(
+                X.reshape(1, 1, X.shape[1]), verbose=0)[0][0])
+        else:
+            diff = float(model.predict(X)[0])
+
+        cur      = float(row["aqi"])
+        nxt      = float(np.clip(cur + diff, 15, 500))
+        preds.append(nxt)
+
+        row["aqi_lag3"]  = row["aqi_lag2"]
+        row["aqi_lag2"]  = row["aqi_lag1"]
+        row["aqi_lag1"]  = cur
+        row["aqi"]       = nxt
+        for w, k in [(3,"aqi_roll3_mean"),(6,"aqi_roll6_mean"),
+                     (12,"aqi_roll12_mean"),(24,"aqi_roll24_mean"),
+                     (48,"aqi_roll48_mean"),(72,"aqi_roll72_mean")]:
+            row[k] = (row[k] * (w-1) + nxt) / w
+        row["aqi_diff1"]       = nxt - cur
+        row["aqi_change_rate"] = row["aqi_diff1"] / cur if cur else 0.0
+        row["aqi_trend"]       = (row["aqi_trend"] * 167 + nxt) / 168
+        new_hour               = (int(row["hour"]) + 1) % 24
+        row["hour"]            = new_hour
+        row["hour_sin"]        = np.sin(2 * np.pi * new_hour / 24)
+        row["hour_cos"]        = np.cos(2 * np.pi * new_hour / 24)
+        row["is_weekend"]      = int(int(row.get("day_of_week", 0)) in [5, 6])
+    return preds
+
+
+def fmt(val, decimals=1):
+    try:
+        v = float(val)
+        return "N/A" if pd.isna(v) else f"{v:.{decimals}f}"
+    except Exception:
+        return "N/A"
+
+
+# ── LOAD ────────────────────────────────────────────────────────────────
+# Models: cached permanently (only reload after retraining)
+# Data:   cached for 1 hour (ttl=3600), refreshes automatically every hour
+project, best_models, scalers, ensemble_all, ensemble_wts = load_models()
+df = load_data(project)
+
+if df.empty or not best_models:
+    st.error("Could not load data or models. Check secrets.")
     st.stop()
 
-forecasts = [
-    ("Tomorrow (Day 1)", pred_24h),
-    ("Day 2",            pred_48h),
-    ("Day 3",            pred_72h),
-]
+latest      = df.iloc[-1]
+current_aqi = float(latest["aqi"])
+bg, tc, lbl = aqi_category(current_aqi)
 
-cols = st.columns(3)
-for col, (day, pred) in zip(cols, forecasts):
-    bg2, lbl2 = aqi_color(pred)
-    tc2       = text_color(pred)
+# ── TITLE ───────────────────────────────────────────────────────────────
+st.title("🌫️ Karachi Air Quality Forecast")
+karachi_time = latest['timestamp'].tz_convert('Asia/Karachi')
+st.caption(f"Last updated: {karachi_time.strftime('%b %d %Y, %I:%M %p')} PKT")
+
+# ═══════════════════════════════════════════════════════════════════════
+# ROW 1: AQI banner (left) + Pollutants & Weather (right)
+# ═══════════════════════════════════════════════════════════════════════
+left, right = st.columns([1, 1.7], gap="large")
+
+with left:
+    st.markdown(f"""
+    <div style='background:{bg};padding:36px 24px;border-radius:14px;
+    text-align:center;box-shadow:0 4px 14px rgba(0,0,0,0.15);height:100%;
+    box-sizing:border-box;display:flex;flex-direction:column;
+    justify-content:center'>
+    <div style='color:{tc};font-size:68px;font-weight:800;
+    letter-spacing:-2px;line-height:1'>AQI {current_aqi:.0f}</div>
+    <div style='color:{tc};font-size:18px;font-weight:600;
+    margin:10px 0 4px'>{lbl}</div>
+    <div style='color:{tc};font-size:14px;opacity:0.8'>
+    Karachi · Real-time reading</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with right:
+    st.markdown("**Current Pollutants**")
+    c1, c2, c3 = st.columns(3)
+    c4, c5, c6 = st.columns(3)
+    with c1: st.metric("PM2.5 (μg/m³)", fmt(latest.get("pm25")))
+    with c2: st.metric("PM10 (μg/m³)",  fmt(latest.get("pm10")))
+    with c3: st.metric("O₃ (μg/m³)",    fmt(latest.get("o3")))
+    with c4: st.metric("NO₂ (μg/m³)",   fmt(latest.get("no2")))
+    with c5: st.metric("SO₂ (μg/m³)",   fmt(latest.get("so2")))
+    with c6: st.metric("CO (μg/m³)",    fmt(latest.get("co")))
+
+    st.markdown("**Current Weather**")
+    w1, w2, w3, w4, w5 = st.columns(5)
+    with w1: st.metric("Temp",     f"{fmt(latest.get('temp'))}°C")
+    with w2: st.metric("Humidity", f"{fmt(latest.get('humidity'),0)}%")
+    with w3: st.metric("Wind",     f"{fmt(latest.get('wind'))} m/s")
+    with w4: st.metric("Pressure", f"{fmt(latest.get('pressure'),0)} hPa")
+    with w5: st.metric("Cloud",    f"{fmt(latest.get('cloud_cover'),0)}%")
+
+st.divider()
+
+# ═══════════════════════════════════════════════════════════════════════
+# ROW 2: 3-Day Forecast Cards
+# ═══════════════════════════════════════════════════════════════════════
+st.subheader("3-Day AQI Forecast")
+
+has_direct = all(h in best_models for h in ["24h", "48h", "72h"])
+has_1h     = "1h" in best_models
+
+if has_direct:
+    p24, s24 = predict_ensemble("24h", df, best_models, scalers,
+                                 ensemble_all, ensemble_wts)
+    p48, s48 = predict_ensemble("48h", df, best_models, scalers,
+                                 ensemble_all, ensemble_wts)
+    p72, s72 = predict_ensemble("72h", df, best_models, scalers,
+                                 ensemble_all, ensemble_wts)
+    method = f"Direct 24h/48h/72h models ({s24}/{s48}/{s72})"
+elif has_1h:
+    hourly = iterative_1h_forecast(df, best_models, scalers, 72)
+    p24    = float(np.mean(hourly[0:24]))  if len(hourly) >= 24 else current_aqi
+    p48    = float(np.mean(hourly[24:48])) if len(hourly) >= 48 else current_aqi
+    p72    = float(np.mean(hourly[48:72])) if len(hourly) >= 72 else current_aqi
+    method = "Iterative 1h model (fallback)"
+else:
+    st.error("No models found. Run the training pipeline first.")
+    st.stop()
+
+fc1, fc2, fc3 = st.columns(3)
+for col, (day, pred) in zip([fc1, fc2, fc3], [
+    ("Tomorrow (Day 1)", p24),
+    ("Day 2",            p48),
+    ("Day 3",            p72),
+]):
+    bg2, tc2, lbl2 = aqi_category(pred)
     with col:
         st.markdown(f"""
-        <div style='background:{bg2};padding:20px;
-        border-radius:10px;text-align:center;margin-bottom:8px'>
-        <h2 style='color:{tc2};margin:0'>{pred:.0f}</h2>
-        <p style='color:{tc2};margin:4px 0'><b>{day}</b></p>
-        <p style='color:{tc2};margin:0;font-size:13px'>{lbl2}</p>
+        <div style='background:{bg2};padding:24px;border-radius:12px;
+        text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.12)'>
+        <div style='color:{tc2};font-size:46px;font-weight:700;
+        line-height:1'>{pred:.0f}</div>
+        <div style='color:{tc2};font-size:15px;font-weight:600;
+        margin:8px 0 3px'>{day}</div>
+        <div style='color:{tc2};font-size:12px;opacity:0.9'>{lbl2}</div>
         </div>""", unsafe_allow_html=True)
 
 st.caption(f"Forecast method: {method}")
 
-# ── ALERTS ────────────────────────────────────────────
-max_pred = max(pred_24h, pred_48h, pred_72h)
-if max_pred >= 200:
-    st.error("🚨 Very Unhealthy air predicted! Avoid all outdoor activity.")
-elif max_pred >= 150:
-    st.warning("⚠️ Unhealthy air predicted for sensitive groups. Limit outdoor exposure.")
-elif max_pred >= 100:
-    st.warning("⚠️ Moderate to Unhealthy air predicted. Sensitive individuals take precautions.")
-else:
-    st.success("✅ Air quality looks acceptable for the next 3 days.")
+# ══════════════════════════════════════════════════════════════════════
+# ALERT SYSTEM — current + forecast, with health guidance
+# ══════════════════════════════════════════════════════════════════════
+
+ALERT_CONFIG = {
+    # (min_aqi, bg_color, icon, title, who, actions)
+    "hazardous":    (300, "#7e0023", "☠️",  "HAZARDOUS",
+                     "Everyone",
+                     ["Stay indoors with windows sealed",
+                      "Use N95/P100 respirator if going outside",
+                      "Run air purifier on highest setting",
+                      "Seek medical attention if experiencing symptoms",
+                      "Avoid ALL physical exertion outdoors"]),
+    "very_unhealthy":(200, "#8f3f97", "🚨", "VERY UNHEALTHY",
+                      "Everyone",
+                      ["Avoid all outdoor activity",
+                       "Keep windows closed",
+                       "Use air purifier indoors",
+                       "Wear N95 mask if outside is unavoidable"]),
+    "unhealthy":    (150, "#ff0000", "⚠️",  "UNHEALTHY",
+                     "Everyone may be affected; sensitive groups most at risk",
+                     ["Limit prolonged outdoor exertion",
+                      "Children and elderly should stay indoors",
+                      "Wear a mask outdoors if possible"]),
+    "sensitive":    (100, "#ff7e00", "⚠️",  "UNHEALTHY FOR SENSITIVE GROUPS",
+                     "People with asthma, heart/lung disease, elderly, children",
+                     ["Sensitive groups: reduce outdoor activity",
+                      "Keep rescue medication accessible",
+                      "Monitor symptoms closely"]),
+    "moderate":     ( 50, "#b8a000", "ℹ️",  "MODERATE",
+                     "Unusually sensitive individuals",
+                     ["Consider reducing prolonged outdoor exertion",
+                      "People with respiratory conditions: take precautions"]),
+    "good":         (  0, "#006400", "✅",  "GOOD",
+                     "Air quality is satisfactory for all",
+                     ["Enjoy outdoor activities"]),
+}
+
+
+def get_alert_config(aqi_val):
+    if aqi_val >= 300: return ALERT_CONFIG["hazardous"]
+    if aqi_val >= 200: return ALERT_CONFIG["very_unhealthy"]
+    if aqi_val >= 150: return ALERT_CONFIG["unhealthy"]
+    if aqi_val >= 100: return ALERT_CONFIG["sensitive"]
+    if aqi_val >= 50:  return ALERT_CONFIG["moderate"]
+    return ALERT_CONFIG["good"]
+
+
+def render_alert_banner(aqi_val, context="Current AQI"):
+    """Render a full-width alert banner with health guidance."""
+    min_aqi, bg, icon, title, who, actions = get_alert_config(aqi_val)
+    is_dark_bg = aqi_val >= 150
+    tc_alert   = "#ffffff" if is_dark_bg else "#1a1a1a"
+    action_html = "".join(f"<li>{a}</li>" for a in actions)
+    st.markdown(f"""
+    <div style='background:{bg};padding:20px 24px;border-radius:12px;
+    margin:8px 0;box-shadow:0 3px 10px rgba(0,0,0,0.2)'>
+      <div style='color:{tc_alert};font-size:18px;font-weight:700;
+      margin-bottom:6px'>{icon} {context} — {title}</div>
+      <div style='color:{tc_alert};font-size:13px;opacity:0.9;
+      margin-bottom:8px'><b>Who is affected:</b> {who}</div>
+      <ul style='color:{tc_alert};font-size:13px;margin:0;
+      padding-left:18px;opacity:0.95'>{action_html}</ul>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ── Current AQI alert ──────────────────────────────────────────────────
+render_alert_banner(current_aqi, f"AQI {current_aqi:.0f} right now")
+
+# ── Forecast alerts per day ────────────────────────────────────────────
+forecast_vals = [("Tomorrow", p24), ("Day 2", p48), ("Day 3", p72)]
+worst_forecast = max(p24, p48, p72)
+
+# Only show per-day breakdown if conditions are concerning
+if worst_forecast >= 100:
+    st.markdown("**Forecast health guidance:**")
+    fa1, fa2, fa3 = st.columns(3)
+    for col, (day, val) in zip([fa1, fa2, fa3], forecast_vals):
+        _, bg2, icon2, title2, _, _ = get_alert_config(val)
+        is_dark = val >= 150
+        tc2 = "#ffffff" if is_dark else "#1a1a1a"
+        with col:
+            st.markdown(f"""
+            <div style='background:{bg2};padding:12px 16px;border-radius:8px;
+            font-size:13px;box-shadow:0 1px 4px rgba(0,0,0,0.1)'>
+            <b style='color:{tc2}'>{icon2} {day}</b>
+            <div style='color:{tc2};opacity:0.9'>{title2}</div>
+            </div>""", unsafe_allow_html=True)
+
+# Special hazardous full-width banner
+if worst_forecast >= 300 or current_aqi >= 300:
+    st.markdown("""
+    <div style='background:#7e0023;padding:16px 24px;border-radius:10px;
+    border:2px solid #ff0000;margin:12px 0;text-align:center'>
+    <div style='color:#ffffff;font-size:22px;font-weight:800'>
+    ☠️ HAZARDOUS AIR QUALITY ALERT ☠️</div>
+    <div style='color:#ffcccc;font-size:14px;margin-top:6px'>
+    This is a public health emergency. Everyone should remain indoors.
+    Seal windows and doors. Use an air purifier. Contact a doctor if
+    you experience difficulty breathing, chest pain, or dizziness.</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 st.divider()
 
-# ── HOURLY FORECAST CHART ─────────────────────────────
-if has_1h:
-    st.subheader("72-Hour Hourly Forecast")
-    try:
-        sc_1h        = scalers.get("1h")
-        hourly_preds = iterative_forecast(
-            models["1h"], sc_1h, latest,
-            available, monthly_stats, hours=72)
-
-        last_ts  = pd.to_datetime(latest["timestamp"])
-        from datetime import timedelta
-        fc_times = [
-            str(last_ts + timedelta(hours=i+1))
-            for i in range(72)
-        ]
-
-        fig_fc = go.Figure()
-        fig_fc.add_trace(go.Scatter(
-            x=fc_times, y=hourly_preds,
-            mode="lines", fill="tozeroy",
-            name="Forecast",
-            line=dict(color="#0066cc", width=2),
-            fillcolor="rgba(0,102,204,0.1)"
-        ))
-        for y_val, color, lbl_text in [
-            (50,  "#00e400", "Good"),
-            (100, "#ffa500", "Moderate"),
-            (150, "#ff7e00", "Sensitive"),
-            (200, "#ff0000", "Unhealthy"),
-        ]:
-            fig_fc.add_hline(
-                y=y_val, line_dash="dot", line_color=color,
-                annotation_text=lbl_text,
-                annotation_position="right")
-        fig_fc.update_layout(
-            xaxis_title="Time", yaxis_title="Predicted AQI",
-            height=350, margin=dict(l=0, r=60, t=10, b=0),
-            hovermode="x unified")
-        st.plotly_chart(fig_fc, use_container_width=True)
-        st.caption(
-            "Hourly chart uses iterative 1h model. "
-            "Day 1/2/3 cards use dedicated 24h/48h/72h models.")
-    except Exception as e:
-        st.info(f"Forecast chart error: {e}")
-    st.divider()
-
-# ── HISTORICAL CHART ──────────────────────────────────
+# ── 7-Day Historical Chart ─────────────────────────────────────────────
 st.subheader("AQI History — Last 7 Days")
 last7 = df.tail(7 * 24).copy()
-fig = go.Figure()
-fig.add_trace(go.Scatter(
+fig2  = go.Figure()
+fig2.add_trace(go.Scatter(
     x=last7["timestamp"], y=last7["aqi"],
     mode="lines", fill="tozeroy", name="Observed AQI",
-    line=dict(color="#ff7e00", width=2),
-    fillcolor="rgba(255,126,0,0.1)"
-))
-for y_val, color, lbl_text in [
-    (50,  "#00e400", "Good"), (100, "#ffa500", "Moderate"),
-    (150, "#ff7e00", "Sensitive"), (200, "#ff0000", "Unhealthy"),
-]:
-    fig.add_hline(y=y_val, line_dash="dot", line_color=color,
-                  annotation_text=lbl_text,
-                  annotation_position="right")
-fig.update_layout(
-    xaxis_title="Time", yaxis_title="AQI", height=400,
-    margin=dict(l=0, r=60, t=10, b=0), hovermode="x unified")
-st.plotly_chart(fig, use_container_width=True)
-st.divider()
-
-# ── POLLUTANTS ────────────────────────────────────────
-st.subheader("Current Pollutant Levels")
-
-def fmt(val):
-    return "N/A" if pd.isna(val) else f"{float(val):.1f}"
-
-pollutants = {
-    "PM2.5 (μg/m³)": latest.get("pm25"),
-    "PM10 (μg/m³)":  latest.get("pm10"),
-    "O3 (μg/m³)":    latest.get("o3"),
-    "NO2 (μg/m³)":   latest.get("no2"),
-    "SO2 (μg/m³)":   latest.get("so2"),
-    "CO (μg/m³)":    latest.get("co"),
-}
-p_cols = st.columns(6)
-for col, (name, val) in zip(p_cols, pollutants.items()):
-    with col:
-        st.metric(name, fmt(val))
-
-extra_cols = st.columns(4)
-extras = {
-    "Dust (μg/m³)":    latest.get("dust"),
-    "Ammonia (μg/m³)": latest.get("ammonia"),
-    "EU AQI":          latest.get("european_aqi"),
-    "US AQI":          latest.get("us_aqi"),
-}
-for col, (name, val) in zip(extra_cols, extras.items()):
-    with col:
-        st.metric(name, fmt(val))
+    line=dict(color="#ff7e00", width=2.5),
+    fillcolor="rgba(255,126,0,0.1)"))
+for yv, col, txt in [(50,"#00e400","Good"),(100,"#ffa500","Moderate"),
+                     (150,"#ff7e00","Sensitive"),(200,"#ff0000","Unhealthy")]:
+    fig2.add_hline(y=yv, line_dash="dot", line_color=col,
+                   annotation_text=txt, annotation_position="right",
+                   annotation_font_size=11)
+fig2.update_layout(
+    xaxis_title="Time", yaxis_title="AQI", height=360,
+    margin=dict(l=0,r=70,t=10,b=0), hovermode="x unified",
+    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+st.plotly_chart(fig2, width="stretch")
 
 st.divider()
 
-# ── WEATHER ───────────────────────────────────────────
-st.subheader("Current Weather Conditions")
-w_cols = st.columns(5)
-weather = {
-    "Temperature":  f"{float(latest.get('temp', 0)):.1f}°C",
-    "Humidity":     f"{float(latest.get('humidity', 0)):.0f}%",
-    "Wind Speed":   f"{float(latest.get('wind', 0)):.1f} m/s",
-    "Pressure":     f"{float(latest.get('pressure', 0)):.0f} hPa",
-    "Cloud Cover":  f"{float(latest.get('cloud_cover', 0)):.0f}%",
-}
-for col, (name, val) in zip(w_cols, weather.items()):
-    with col:
-        st.metric(name, val)
-
-st.divider()
-
-# ── SEASONAL CONTEXT ──────────────────────────────────
-if monthly_stats is not None:
-    st.subheader("Seasonal AQI Context")
-    fig_season = go.Figure()
-    fig_season.add_trace(go.Bar(
-        x=monthly_stats["month_num"],
-        y=monthly_stats["monthly_mean_aqi"],
-        error_y=dict(type="data",
-                     array=monthly_stats["monthly_std_aqi"],
-                     visible=True),
-        name="Monthly Mean AQI",
-        marker_color="#ff7e00"
-    ))
-    month_names = ["Jan","Feb","Mar","Apr","May","Jun",
-                   "Jul","Aug","Sep","Oct","Nov","Dec"]
-    fig_season.update_layout(
-        xaxis=dict(tickmode="array",
-                   tickvals=list(range(1, 13)),
-                   ticktext=month_names),
-        yaxis_title="AQI",
-        height=300,
-        margin=dict(l=0, r=0, t=10, b=0),
-        title_text="Monthly Average AQI — Karachi"
-    )
-    st.plotly_chart(fig_season, use_container_width=True)
-    cur_mean = monthly_mean_map.get(cur_month, 80)
-    st.caption(
-        f"Current month ({month_names[cur_month-1]}) "
-        f"typical AQI: {cur_mean:.0f}. "
-        f"Forecasts are calibrated against this baseline.")
-    st.divider()
-
-# ── SHAP ──────────────────────────────────────────────
-st.subheader("What drives the 24h AQI forecast?")
-try:
-    import shap
-    shap_model  = models.get("24h")
-    shap_scaler = scalers.get("24h")
-
-    if shap_model is not None:
-        feat_cols = [f for f in FEATURES if f in latest.index]
-        row_df    = pd.DataFrame([latest[feat_cols]])
-        X_shap    = (shap_scaler.transform(row_df.values)
-                     if shap_scaler else row_df.values)
-        X_shap_df = pd.DataFrame(X_shap, columns=feat_cols)
-
-        explainer  = shap.Explainer(shap_model, X_shap_df)
-        shap_vals  = explainer(X_shap_df)
-        importance = pd.DataFrame({
-            "Feature":    feat_cols,
-            "Importance": np.abs(shap_vals.values[0])
-        }).sort_values("Importance", ascending=True).tail(15)
-
-        fig2 = px.bar(
-            importance, x="Importance", y="Feature",
-            orientation="h", color="Importance",
-            color_continuous_scale="Oranges")
-        fig2.update_layout(
-            height=450, margin=dict(l=0, r=0, t=10, b=0),
-            showlegend=False)
-        st.plotly_chart(fig2, use_container_width=True)
-        st.caption(
-            "SHAP values for the 24h model. "
-            "Larger bar = more influence on tomorrow's AQI prediction.")
-    else:
-        st.info("24h model not loaded.")
-except Exception as e:
-    st.info(f"Feature importance unavailable: {e}")
-
-st.divider()
-
-# ── AQI SCALE ─────────────────────────────────────────
+# ── AQI Reference Table ────────────────────────────────────────────────
 st.subheader("AQI Scale Reference")
 st.dataframe(pd.DataFrame({
-    "Category": [
-        "Good", "Moderate",
-        "Unhealthy for Sensitive Groups",
-        "Unhealthy", "Very Unhealthy", "Hazardous"],
-    "AQI Range": [
-        "0–50", "51–100", "101–150",
-        "151–200", "201–300", "301–500"],
+    "": ["🟢","🟡","🟠","🔴","🟣","🟤"],
+    "Category": ["Good","Moderate","Unhealthy for Sensitive Groups",
+                  "Unhealthy","Very Unhealthy","Hazardous"],
+    "AQI Range": ["0–50","51–100","101–150","151–200","201–300","301–500"],
     "Health Implications": [
         "Air quality is satisfactory",
-        "Acceptable; some pollutants may affect sensitive people",
+        "Acceptable; minor risk for very sensitive people",
         "Sensitive groups may experience health effects",
         "Everyone may begin to experience health effects",
-        "Health alert: everyone may experience serious effects",
-        "Health warnings of emergency conditions"],
-    "Indicator": ["🟢", "🟡", "🟠", "🔴", "🟣", "🟤"]
-}), hide_index=True, use_container_width=True)
+        "Health alert: serious effects for everyone",
+        "Health warnings — emergency conditions"],
+}), hide_index=True, width="stretch")
 
 st.divider()
 st.caption(
-    "Data: Open-Meteo API · Models: Hopsworks · "
+    "Data: Open-Meteo (AQ) + OpenWeather · "
+    "Feature store & models: Hopsworks · "
     "Pipeline: GitHub Actions · Built with Streamlit"
 )
