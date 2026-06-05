@@ -442,7 +442,7 @@ if __name__ == "__main__":
         print("[INFO] This is expected during brief API outages.")
         print("[INFO] The next hourly run will try again.")
         sys.exit(0)  # exit 0 = success, so GitHub Actions doesn't flag it
-    now  = datetime.now(timezone.utc)
+    now  = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     now_str = now.isoformat()
     ts   = pd.Timestamp(now_str)
 
@@ -505,10 +505,33 @@ if __name__ == "__main__":
     }
 
     df = pd.DataFrame([row])
-    # Do NOT cast timestamp to str — store_features will ensure datetime64 type
+    print(f"\nRow to insert: timestamp={now}  aqi={row['aqi']}")
 
     # ── Step 6: store feature row ──────────────────────────────────
+    # Debug: count rows before insert so we can confirm a new row was added
+    try:
+        fs_debug = project.get_feature_store()
+        fg_debug = fs_debug.get_feature_group("aqi_features", version=1)
+        rows_before = len(fg_debug.read())
+        print(f"Rows in feature group BEFORE insert: {rows_before}")
+    except Exception as e:
+        print(f"  [DEBUG] Could not count rows before: {e}")
+        rows_before = -1
+
     store_features(df, project)
+
+    # Debug: confirm row was actually added
+    try:
+        fs_debug2 = project.get_feature_store()
+        fg_debug2 = fs_debug2.get_feature_group("aqi_features", version=1)
+        rows_after = len(fg_debug2.read())
+        print(f"Rows in feature group AFTER insert: {rows_after}")
+        if rows_after > rows_before:
+            print(f"  SUCCESS: +{rows_after - rows_before} row(s) added")
+        else:
+            print(f"  WARNING: row count unchanged — possible duplicate timestamp or insert failed")
+    except Exception as e:
+        print(f"  [DEBUG] Could not count rows after: {e}")
 
     # ── Step 7: print forecast summary (available for app use) ────
     if forecast_feats:
