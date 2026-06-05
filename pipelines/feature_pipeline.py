@@ -415,13 +415,16 @@ def store_features(df, project):
         description="Hourly AQI features Karachi — v6 (extended lags, no forecast cols)",
         online_enabled=False,
     )
-    fg.insert(df, write_options={"wait_for_job": False})
-    # wait_for_job=False: trigger the offline materialization job but don't
-    # block the pipeline waiting for it to finish (Spark jobs take 1-3 min).
-    # The job runs asynchronously and the data will be available for the next
-    # training run. Using {} instead caused the offline job to never trigger
-    # on GitHub Actions (where confluent_kafka is installed and the Kafka
-    # write path is taken, which requires explicit offline job triggering).
+    fg.insert(df, write_options={"wait_for_job": True})
+    # wait_for_job=True: block until the offline Spark materialization job
+    # completes. This is essential when using hopsworks 4.7.x client because
+    # on that version the insert goes through the Kafka streaming path, and
+    # wait_for_job=False means the offline Hudi table never gets updated
+    # (the Kafka message is consumed but the materialization job is never
+    # triggered server-side without this flag).
+    # Runtime impact: adds ~2-3 min to the pipeline run (Spark job startup).
+    # This is why the pipeline now runs for 3-5 min instead of 1 min —
+    # that is the correct behaviour matching what local runs do.
     print(f"Stored row — timestamp={df['timestamp'].iloc[0]}, "
           f"aqi={df['aqi'].iloc[0]}, columns={len(df.columns)}")
 

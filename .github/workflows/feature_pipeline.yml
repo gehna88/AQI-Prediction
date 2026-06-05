@@ -26,6 +26,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Spark materialization job takes 2-3 min to complete
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,14 +40,20 @@ jobs:
 
       - name: Install dependencies
         # tensorflow excluded — feature pipeline does not use it.
-        # Keeps install time ~30s instead of ~3min.
+        # hopsworks pinned to 4.8.* to match local development environment.
+        # CRITICAL: hopsworks 4.7.* on CI uses the Kafka streaming insert
+        # path which does NOT trigger offline materialization even with
+        # wait_for_job=True in some configurations. hopsworks 4.8.* client
+        # with 4.7.2 server falls back to the batch insert path (same as
+        # running locally) which ALWAYS triggers offline materialization.
+        # This is why local runs showed materialization but CI runs did not.
         run: |
           pip install \
             "numpy>=1.26,<3" \
             "pandas>=2.1,<3" \
             "pyarrow>=14.0" \
             "requests>=2.31" \
-            "hopsworks==4.7.*" \
+            "hopsworks==4.8.*" \
             "confluent-kafka>=2.3" \
             "python-dotenv>=1.0"
 
