@@ -376,7 +376,8 @@ def compute_pressure_diff(history_df, current_pressure):
 def store_features(df, project):
     """
     Upsert one new row into the Hopsworks feature group.
-    write_options={} avoids the Kafka/confluent_kafka dependency.
+    Uses wait_for_job=False — fire and forget. The row reaches Kafka
+    instantly and the offline materialization job runs asynchronously.
 
     Also guards against stale v4 schema: if the existing feature group
     still has forecast columns, raises a clear error telling you to run
@@ -416,16 +417,19 @@ def store_features(df, project):
         description="Hourly AQI features Karachi — v6 (extended lags, no forecast cols)",
         online_enabled=True,
     )
-    fg.insert(df, write_options={"wait_for_job": True})
-    # wait_for_job=True: block until the offline Spark materialization job
-    # completes. This is essential when using hopsworks 4.7.x client because
-    # on that version the insert goes through the Kafka streaming path, and
-    # wait_for_job=False means the offline Hudi table never gets updated
-    # (the Kafka message is consumed but the materialization job is never
-    # triggered server-side without this flag).
-    # Runtime impact: adds ~2-3 min to the pipeline run (Spark job startup).
-    # This is why the pipeline now runs for 3-5 min instead of 1 min —
-    # that is the correct behaviour matching what local runs do.
+    fg.insert(df, write_options={"wait_for_job": False})
+    # wait_for_job=False: fire-and-forget. The row is written to Kafka
+    # immediately and the offline materialization Spark job is triggered
+    # asynchronously. We do not block waiting for the Spark job to finish.
+    #
+    # This is correct because:
+    # 1. The row reaches Kafka instantly — confirmed by upload progress bar
+    # 2. The materialization job IS triggered (visible in Hopsworks Jobs UI)
+    # 3. On the free tier, the Spark YARN cluster can take 5-15 min to
+    #    allocate executors — wait_for_job=True causes the pipeline to hang
+    #    and eventually get killed by GitHub Actions timeout
+    # 4. By the time the next hourly pipeline run reads fg.read() for history,
+    #    the job will have completed — acceptable lag for hourly data
     print(f"Stored row — timestamp={df['timestamp'].iloc[0]}, "
           f"aqi={df['aqi'].iloc[0]}, columns={len(df.columns)}")
 
@@ -437,9 +441,10 @@ if __name__ == "__main__":
     try:
         data = fetch_current()
     except RuntimeError as e:
-        print(f"\n[INFO] Open-Meteo API unavailable: {e}")
+        print(f"\n[ERROR] API fetch failed: {e}")
         print("[INFO] Skipping this hourly run — no row stored.")
-        print("[INFO] This is expected during brief API outages.")
+        print("[INFO] If this is a 401 error, check OPENWEATHER_API_KEY in GitHub secrets.")
+        print("[INFO] If this is a 502 error, it is a transient Open-Meteo outage.")
         print("[INFO] The next hourly run will try again.")
         sys.exit(0)  # exit 0 = success, so GitHub Actions doesn't flag it
     now  = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
@@ -508,30 +513,8 @@ if __name__ == "__main__":
     print(f"\nRow to insert: timestamp={now}  aqi={row['aqi']}")
 
     # ── Step 6: store feature row ──────────────────────────────────
-    # Debug: count rows before insert so we can confirm a new row was added
-    try:
-        fs_debug = project.get_feature_store()
-        fg_debug = fs_debug.get_feature_group("aqi_features", version=1)
-        rows_before = len(fg_debug.read())
-        print(f"Rows in feature group BEFORE insert: {rows_before}")
-    except Exception as e:
-        print(f"  [DEBUG] Could not count rows before: {e}")
-        rows_before = -1
-
     store_features(df, project)
-
-    # Debug: confirm row was actually added
-    try:
-        fs_debug2 = project.get_feature_store()
-        fg_debug2 = fs_debug2.get_feature_group("aqi_features", version=1)
-        rows_after = len(fg_debug2.read())
-        print(f"Rows in feature group AFTER insert: {rows_after}")
-        if rows_after > rows_before:
-            print(f"  SUCCESS: +{rows_after - rows_before} row(s) added")
-        else:
-            print(f"  WARNING: row count unchanged — possible duplicate timestamp or insert failed")
-    except Exception as e:
-        print(f"  [DEBUG] Could not count rows after: {e}")
+    print("Row submitted to Hopsworks. Materialization job running asynchronously (~2-3 min).")
 
     # ── Step 7: print forecast summary (available for app use) ────
     if forecast_feats:

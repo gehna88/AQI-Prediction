@@ -401,8 +401,31 @@ def store_features(df):
         online_enabled=True,
     )
 
-    fg.insert(df, write_options={"wait_for_job": True})
+    # Insert in chunks of 500 rows with wait_for_job=False.
+    #
+    # WHY CHUNKED:
+    #   Inserting 4000+ rows in one batch triggers a massive Hudi compaction
+    #   that can take 9+ hours if the YARN cluster is under load. Smaller
+    #   batches let Hopsworks process each chunk incrementally.
+    #
+    # WHY wait_for_job=False:
+    #   We do not block waiting for the Spark job. If the process is
+    #   interrupted mid-backfill, no zombie job is left running.
+    #   All rows are in Kafka and will materialize asynchronously.
+    #   The final fg.read() in training_pipeline will see all rows
+    #   once the last materialization job completes (~2-3 min after
+    #   the last chunk is inserted).
+    chunk_size = 500
+    total = len(df)
+    for i in range(0, total, chunk_size):
+        chunk = df.iloc[i:i+chunk_size]
+        print(f"  Inserting rows {i+1}–{min(i+chunk_size, total)} of {total}...")
+        fg.insert(chunk, write_options={"wait_for_job": False})
+        if i + chunk_size < total:
+            time.sleep(2)  # brief pause between chunks
+
     print(f"Upserted {len(df)} rows × {len(df.columns)} columns → Hopsworks")
+    print("Materialization jobs running asynchronously in background.")
 
 
 if __name__ == "__main__":
