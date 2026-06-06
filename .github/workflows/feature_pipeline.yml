@@ -26,7 +26,8 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # Spark materialization job takes 2-3 min to complete
+    timeout-minutes: 20  # Spark materialization + Hudi compaction can take up to 15 min
+                         # on large feature groups (4000+ rows). 20 min is safe ceiling.
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -63,3 +64,4 @@ jobs:
           HOPSWORKS_API_KEY:    ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT:    ${{ secrets.HOPSWORKS_PROJECT }}
           OPENWEATHER_API_KEY:  ${{ secrets.OPENWEATHER_API_KEY }}
+          MONGODB_URI:          ${{ secrets.MONGODB_URI }}

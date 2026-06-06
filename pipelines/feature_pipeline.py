@@ -265,24 +265,23 @@ def fetch_weather_forecasts(now_ts):
     return result
 
 
-def fetch_recent_history(project, n_hours=169):
+def fetch_recent_history(n_hours=169):
     """
-    Read the last n_hours rows from Hopsworks for lag feature computation.
+    Read the last n_hours rows from MongoDB for lag feature computation.
     n_hours=169 because lag168 requires 168 historical rows plus current = 169.
     Returns DataFrame sorted oldest-first, or empty DataFrame on failure.
     """
     try:
-        fs = project.get_feature_store()
-        fg = fs.get_feature_group("aqi_features", version=1)
-        df = fg.read()
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from mongo_store import read_latest
+        df = read_latest(n_hours)
         if df is None or len(df) == 0:
-            print("  [WARN] Feature group is empty — first run after backfill?")
+            print("  [WARN] MongoDB is empty — first run after backfill?")
             return pd.DataFrame()
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        return df.tail(n_hours).reset_index(drop=True)
+        return df
     except Exception as e:
-        print(f"  [WARN] Could not fetch history: {e}")
+        print(f"  [WARN] Could not fetch history from MongoDB: {e}")
         return pd.DataFrame()
 
 
@@ -373,63 +372,24 @@ def compute_pressure_diff(history_df, current_pressure):
     return (current_pressure - prev) if not np.isnan(prev) else np.nan
 
 
-def store_features(df, project):
+def store_features(df, project=None):
     """
-    Upsert one new row into the Hopsworks feature group.
-    Uses wait_for_job=False — fire and forget. The row reaches Kafka
-    instantly and the offline materialization job runs asynchronously.
+    Upsert one new row into MongoDB Atlas.
+    project argument kept for backward compatibility but not used.
+    """
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from mongo_store import store_df
 
-    Also guards against stale v4 schema: if the existing feature group
-    still has forecast columns, raises a clear error telling you to run
-    backfill_pipeline.py first (which handles the migration).
-    """
     df = df.copy()
     df["aqi"]         = df["aqi"].round().astype("int64")
     df["hour"]        = df["hour"].astype("int64")
     df["day_of_week"] = df["day_of_week"].astype("int64")
     df["month"]       = df["month"].astype("int64")
     df["is_weekend"]  = df["is_weekend"].astype("int64")
-    # Keep timestamp as proper datetime — Hopsworks requires TIMESTAMP not string
     df["timestamp"]   = pd.to_datetime(df["timestamp"], utc=True)
 
-    fs = project.get_feature_store()
-
-    STALE_FORECAST_COLS = {"temp_forecast_24h", "temp_forecast_48h", "temp_forecast_72h"}
-    NEW_V6_COLS = {"aqi_lag72", "aqi_lag168", "aqi_roll48_mean", "aqi_roll72_mean"}
-    try:
-        existing_fg = fs.get_feature_group("aqi_features", version=1)
-        existing_cols = {f.name for f in existing_fg.features}
-        if existing_cols & STALE_FORECAST_COLS or (NEW_V6_COLS - existing_cols):
-            raise RuntimeError(
-                "Feature group has an outdated schema. "
-                "Run backfill_pipeline.py first — it will migrate the schema."
-            )
-    except RuntimeError:
-        raise
-    except Exception:
-        pass
-
-    fg = fs.get_or_create_feature_group(
-        name="aqi_features",
-        version=1,
-        primary_key=["timestamp"],
-        event_time="timestamp",
-        description="Hourly AQI features Karachi — v6 (extended lags, no forecast cols)",
-        online_enabled=True,
-    )
-    fg.insert(df, write_options={"wait_for_job": False})
-    # wait_for_job=False: fire-and-forget. The row is written to Kafka
-    # immediately and the offline materialization Spark job is triggered
-    # asynchronously. We do not block waiting for the Spark job to finish.
-    #
-    # This is correct because:
-    # 1. The row reaches Kafka instantly — confirmed by upload progress bar
-    # 2. The materialization job IS triggered (visible in Hopsworks Jobs UI)
-    # 3. On the free tier, the Spark YARN cluster can take 5-15 min to
-    #    allocate executors — wait_for_job=True causes the pipeline to hang
-    #    and eventually get killed by GitHub Actions timeout
-    # 4. By the time the next hourly pipeline run reads fg.read() for history,
-    #    the job will have completed — acceptable lag for hourly data
+    store_df(df)
     print(f"Stored row — timestamp={df['timestamp'].iloc[0]}, "
           f"aqi={df['aqi'].iloc[0]}, columns={len(df.columns)}")
 
@@ -459,8 +419,8 @@ if __name__ == "__main__":
     print("Fetching weather forecasts (inference-only, not stored)...")
     forecast_feats = fetch_weather_forecasts(ts)
 
-    # ── Step 3: connect to Hopsworks ──────────────────────────────
-    print("Connecting to Hopsworks...")
+    # ── Step 3: connect to Hopsworks (for model registry only) ───
+    print("Connecting to Hopsworks (model registry)...")
     project = hopsworks.login(
         project=os.getenv("HOPSWORKS_PROJECT"),
         api_key_value=os.getenv("HOPSWORKS_API_KEY")
@@ -468,7 +428,7 @@ if __name__ == "__main__":
 
     # ── Step 4: fetch history for real lag features ────────────────
     print("Fetching recent history for lag features...")
-    history = fetch_recent_history(project)  # default n_hours=169 for lag168
+    history = fetch_recent_history()
     if len(history) == 0:
         print("  [WARN] No history available — lag features will be NaN")
         print("  [INFO] Run backfill_pipeline.py first to populate history")

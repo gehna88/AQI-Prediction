@@ -101,7 +101,11 @@ FEATURES = [
     # ── Current weather ─────────────────────────────────────────────
     "temp", "humidity", "wind", "wind_gusts",
     "precipitation", "pressure", "cloud_cover",
-    "dew_point", "apparent_temp", "solar_rad",
+    "dew_point", "apparent_temp",
+    # solar_rad removed: OpenWeather free tier never provides it, so every
+    # live inference row has solar_rad=NaN, imputed to median. The model
+    # was trained on real backfill values → systematic mismatch at inference
+    # → spurious SHAP values (+1.7 for 24h, +0.98 for 48h). Removed.
 
     # ── Time ────────────────────────────────────────────────────────
     "hour", "day_of_week", "month", "is_weekend",
@@ -153,15 +157,22 @@ TREND_WINDOW_HOURS = 168  # 7-day rolling mean
 
 
 def load_features():
-    print("Connecting to Hopsworks...")
+    """Load all feature rows from MongoDB Atlas."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+    from mongo_store import read_df
+
+    print("Loading features from MongoDB Atlas...")
+    df = read_df()
+    if df is None or len(df) == 0:
+        raise RuntimeError("MongoDB is empty — run backfill_pipeline.py first.")
+    print(f"Loaded {len(df)} rows, {len(df.columns)} columns")
+
+    # Still connect to Hopsworks for model registry
     project = hopsworks.login(
         project=os.getenv("HOPSWORKS_PROJECT"),
         api_key_value=os.getenv("HOPSWORKS_API_KEY")
     )
-    fs  = project.get_feature_store()
-    fg  = fs.get_feature_group("aqi_features", version=1)
-    df  = fg.read()
-    print(f"Loaded {len(df)} rows, {len(df.columns)} columns")
     return df, project
 
 
@@ -455,40 +466,114 @@ def train_models(X_train, X_test,
     print(f"  → Baseline RMSE={baseline_rmse:.2f}  "
           f"Improvement={improvement:.1f}%")
 
-    return best, best_name
+    # Return ALL results so save_models can build the ensemble
+    return results, best_name
+
+
+def compute_ensemble_weights(results_dict, horizon):
+    """
+    Compute R²-proportional weights for ensemble blending.
+    Only include models with positive R² (negative R² models hurt the ensemble).
+    Returns a dict: {model_name: weight} that sums to 1.0.
+
+    Rationale per horizon:
+      1h:  RF near-perfect → RF dominates; LSTM slightly negative → exclude
+      24h: RF best → RF×0.6 + LSTM×0.4 (when LSTM R² is positive)
+      48h: LSTM best → LSTM×0.6 + Ridge×0.4
+      72h: LSTM dominates → LSTM×0.65 + Ridge×0.35
+    """
+    # Filter to models with positive R²
+    positive = {k: v for k, v in results_dict.items() if v["r2"] > 0}
+    if not positive:
+        # Fall back to the single best by R²_diff
+        best_k = max(results_dict, key=lambda k: results_dict[k]["r2_diff"])
+        return {best_k: 1.0}
+    if len(positive) == 1:
+        return {list(positive.keys())[0]: 1.0}
+
+    # R²-proportional weights among positive-R² models
+    total_r2 = sum(v["r2"] for v in positive.values())
+    weights = {k: v["r2"] / total_r2 for k, v in positive.items()}
+
+    # Print ensemble composition
+    parts = "  ".join(f"{k}×{w:.2f}" for k, w in weights.items())
+    print(f"    Ensemble ({horizon}): {parts}")
+    return weights
 
 
 def save_models(horizon_results, project):
+    """
+    Save all trained models for each horizon plus ensemble weights.
+    The model bundle contains:
+      - model_{horizon}.pkl         : best single model (sklearn/XGBoost)
+      - lstm_model_{horizon}.keras  : LSTM model (if LSTM was trained)
+      - all_{horizon}.pkl           : all model results (for ensemble)
+      - ensemble_weights_{horizon}.pkl : {model_name: weight}
+      - scaler_{horizon}.pkl        : StandardScaler fitted on training data
+      - meta_{horizon}.pkl          : reconstruction metadata
+    """
     mr = project.get_model_registry()
 
-    for horizon, (result, best_name) in horizon_results.items():
-        tmp_dir = tempfile.mkdtemp(prefix=f"aqi_{horizon}_")
+    for horizon, (all_results, best_name) in horizon_results.items():
+        # horizon_results[h] = (all_results_dict, best_name)
+        # all_results_dict = {name: {model, rmse, mae, r2, r2_diff, scaler, ...}}
+        best_result = all_results[best_name]
+        tmp_dir     = tempfile.mkdtemp(prefix=f"aqi_{horizon}_")
         try:
+            # ── Save best model ────────────────────────────────────────
             model_fname  = os.path.join(tmp_dir, f"model_{horizon}.pkl")
             scaler_fname = os.path.join(tmp_dir, f"scaler_{horizon}.pkl")
 
-            # Save a small metadata file so the app knows how to reconstruct
+            if best_result.get("is_lstm"):
+                lstm_path = os.path.join(tmp_dir, f"lstm_model_{horizon}.keras")
+                best_result["model"].save(lstm_path)
+                joblib.dump({"type": "lstm",
+                             "path": f"lstm_model_{horizon}.keras"},
+                            model_fname)
+            else:
+                joblib.dump(best_result["model"], model_fname)
+
+            joblib.dump(best_result["scaler"], scaler_fname)
+
+            # ── Save ALL models for ensemble ───────────────────────────
+            all_pkl = os.path.join(tmp_dir, f"all_{horizon}.pkl")
+            ensemble_bundle = {}
+            for name, res in all_results.items():
+                entry = {
+                    "r2":      res["r2"],
+                    "r2_diff": res["r2_diff"],
+                    "rmse":    res["rmse"],
+                    "scaled":  res["scaled"],
+                    "is_lstm": res.get("is_lstm", False),
+                }
+                if res.get("is_lstm"):
+                    lstm_path_e = os.path.join(
+                        tmp_dir, f"lstm_model_{horizon}_{name}.keras")
+                    res["model"].save(lstm_path_e)
+                    entry["model"] = {"type": "lstm",
+                                      "path": f"lstm_model_{horizon}_{name}.keras"}
+                else:
+                    entry["model"] = res["model"]
+                ensemble_bundle[name] = entry
+            joblib.dump(ensemble_bundle, all_pkl)
+
+            # ── Compute and save ensemble weights ──────────────────────
+            weights = compute_ensemble_weights(all_results, horizon)
+            joblib.dump(weights,
+                        os.path.join(tmp_dir,
+                                     f"ensemble_weights_{horizon}.pkl"))
+
+            # ── Save metadata ──────────────────────────────────────────
             meta = {
-                "approach":    "differenced_target",
-                "reconstruct": "predicted_aqi = aqi_now + model.predict(features)",
-                "horizon":     horizon,
-                "best_model":  best_name,
+                "approach":         "differenced_target",
+                "reconstruct":      "predicted_aqi = aqi_now + model.predict(features)",
+                "horizon":          horizon,
+                "best_model":       best_name,
+                "ensemble_weights": weights,
             }
             joblib.dump(meta, os.path.join(tmp_dir, f"meta_{horizon}.pkl"))
 
-            if result.get("is_lstm"):
-                lstm_path = os.path.join(
-                    tmp_dir, f"lstm_model_{horizon}.keras")
-                result["model"].save(lstm_path)
-                joblib.dump(
-                    {"type": "lstm",
-                     "path": f"lstm_model_{horizon}.keras"},
-                    model_fname)
-            else:
-                joblib.dump(result["model"], model_fname)
-
-            joblib.dump(result["scaler"], scaler_fname)
-
+            # ── Register in Hopsworks ──────────────────────────────────
             model_name = f"aqi_model_{horizon}"
             try:
                 existing = mr.get_models(name=model_name)
@@ -497,28 +582,26 @@ def save_models(horizon_results, project):
             except Exception:
                 version = 1
 
-            # Hopsworks stores description in a MySQL column that rejects
-            # multi-byte UTF-8 characters (e.g. the Greek α in "Ridge(α=500)").
-            # Replace any non-ASCII characters with ASCII equivalents first.
             safe_name = best_name.encode("ascii", errors="replace").decode("ascii")
-            safe_name = safe_name.replace("?", "a")  # α → ? → a
+            safe_name = safe_name.replace("?", "a")
             model_obj = mr.python.create_model(
                 name=model_name,
                 version=version,
                 metrics=dict(
-                    rmse=round(result["rmse"], 3),
-                    mae=round(result["mae"],  3),
-                    r2=round(result["r2"],   3),
-                    r2_diff=round(result["r2_diff"], 3),
+                    rmse=round(best_result["rmse"], 3),
+                    mae=round(best_result["mae"],  3),
+                    r2=round(best_result["r2"],   3),
+                    r2_diff=round(best_result["r2_diff"], 3),
                 ),
                 description=(
-                    f"{safe_name} -- Karachi AQI {horizon} "
+                    f"{safe_name} + ensemble -- Karachi AQI {horizon} "
                     f"(differenced-target, v6)"
                 )
             )
             model_obj.save(tmp_dir)
             print(f"  Saved aqi_model_{horizon} v{version}  "
-                  f"R²={result['r2']:.3f}  R²_diff={result['r2_diff']:.3f}")
+                  f"R²={best_result['r2']:.3f}  "
+                  f"ensemble_weights={weights}")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -579,10 +662,11 @@ if __name__ == "__main__":
         horizon_results[horizon] = (result, best_name)
 
     print("\n── Summary ─────────────────────────────────────")
-    print(f"  {'Horizon':8s}  {'Model':22s}  {'RMSE':>8}  "
+    print(f"  {'Horizon':8s}  {'Best model':22s}  {'RMSE':>8}  "
           f"{'R²':>7}  {'R²_diff':>8}")
     print(f"  {'-'*8}  {'-'*22}  {'-'*8}  {'-'*7}  {'-'*8}")
-    for h, (r, name) in horizon_results.items():
+    for h, (all_res, name) in horizon_results.items():
+        r = all_res[name]
         print(f"  {h:8s}  {name:22s}  {r['rmse']:8.2f}  "
               f"{r['r2']:7.3f}  {r['r2_diff']:8.3f}")
 

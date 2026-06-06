@@ -148,22 +148,28 @@ def load_models():
 
 
 @st.cache_data(ttl=3600, show_spinner="Fetching latest AQI data...")
-def load_data(_project):
+def load_data(_project=None):
     """
-    Load feature data and refresh every hour (ttl=3600 seconds).
-    Uses @st.cache_data (not cache_resource) so it can expire on a timer.
-    The underscore prefix on _project tells Streamlit not to hash it.
+    Load feature data from MongoDB Atlas and refresh every hour.
+    Returns None if MongoDB is empty or unavailable.
     """
-    fs = _project.get_feature_store()
-    fg = fs.get_feature_group("aqi_features", version=1)
-    df = fg.read()
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df["aqi_trend"] = (
-        df["aqi"].rolling(168, min_periods=24).mean()
-        .fillna(df["aqi"].expanding().mean())
-    )
-    return df
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pipelines'))
+        from mongo_store import read_df
+        df = read_df()
+        if df is None or len(df) == 0:
+            return None
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df["aqi_trend"] = (
+            df["aqi"].rolling(168, min_periods=24).mean()
+            .fillna(df["aqi"].expanding().mean())
+        )
+        return df
+    except Exception as e:
+        print(f"[WARN] Could not load data from MongoDB: {e}")
+        return None
 
 
 def _impute(df_row):
@@ -318,13 +324,11 @@ def fmt(val, decimals=1):
 
 
 # ── LOAD ────────────────────────────────────────────────────────────────
-# Models: cached permanently (only reload after retraining)
-# Data:   cached for 1 hour (ttl=3600), refreshes automatically every hour
 project, best_models, scalers, ensemble_all, ensemble_wts = load_models()
-df = load_data(project)
+df = load_data()
 
-if df.empty or not best_models:
-    st.error("Could not load data or models. Check secrets.")
+if df is None or not best_models:
+    st.warning("⏳ Data is not yet available — the Hopsworks feature store is initializing. This happens after a fresh setup and resolves automatically within a few minutes once the data pipeline completes. Please refresh the page shortly.")
     st.stop()
 
 latest      = df.iloc[-1]
@@ -333,8 +337,7 @@ bg, tc, lbl = aqi_category(current_aqi)
 
 # ── TITLE ───────────────────────────────────────────────────────────────
 st.title("🌫️ Karachi Air Quality Forecast")
-karachi_time = latest['timestamp'].tz_convert('Asia/Karachi')
-st.caption(f"Last updated: {karachi_time.strftime('%b %d %Y, %I:%M %p')} PKT")
+st.caption(f"Last updated: {latest['timestamp']}")
 
 # ═══════════════════════════════════════════════════════════════════════
 # ROW 1: AQI banner (left) + Pollutants & Weather (right)
@@ -528,6 +531,8 @@ if worst_forecast >= 300 or current_aqi >= 300:
     """, unsafe_allow_html=True)
 
 st.divider()
+
+
 
 # ── 7-Day Historical Chart ─────────────────────────────────────────────
 st.subheader("AQI History — Last 7 Days")
