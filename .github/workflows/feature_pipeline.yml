@@ -56,6 +56,7 @@ jobs:
             "requests>=2.31" \
             "hopsworks==4.8.*" \
             "confluent-kafka>=2.3" \
+            "pymongo>=4.6" \
             "python-dotenv>=1.0"
 
       - name: Run feature pipeline
