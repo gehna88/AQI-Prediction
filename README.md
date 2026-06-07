@@ -43,12 +43,7 @@ The best model (XGBoost) achieves R²=0.994 and RMSE=1.30 at 1h. The 24h Ridge m
 
 **Features:**
 - Real-time AQI display with EPA health category and color coding
-- 72-hour interactive forecast chart with hover scrubbing
-- 3-day daily summary cards (avg / min / max AQI)
-- SHAP feature importance bar chart for model explainability
 - Health advisory with actionable recommendations per AQI level
-- Ensemble model comparison table (Ridge, RandomForest, XGBoost, LSTM)
-- Auto-refreshes data every hour via `@st.cache_data(ttl=3600)`
 
 ---
 
