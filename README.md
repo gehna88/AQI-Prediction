@@ -6,7 +6,19 @@ End-to-end serverless AQI forecasting pipeline for Karachi — predicts US Air Q
 ![TensorFlow](https://img.shields.io/badge/TensorFlow-2.16-orange?logo=tensorflow)
 ![MongoDB](https://img.shields.io/badge/MongoDB-Atlas-green?logo=mongodb)
 ![Streamlit](https://img.shields.io/badge/Dashboard-Streamlit-ff4b4b?logo=streamlit)
+![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi)
 ![GitHub Actions](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-black?logo=github-actions)
+
+---
+
+## 🚀 Live Deployments
+
+| Resource | URL |
+|----------|-----|
+| 🌐 Dashboard | https://karachi-aqi-prediction.streamlit.app |
+| 🔌 REST API | https://gehna88-karachi-aqi-api.hf.space |
+| 📖 API Docs (Swagger) | https://gehna88-karachi-aqi-api.hf.space/docs |
+| 💻 GitHub | https://github.com/gehna88/AQI-Prediction |
 
 ---
 
@@ -22,6 +34,43 @@ Karachi is one of South Asia's most polluted megacities, yet real-time AQI forec
 - Explains every prediction using **SHAP** (for tree/linear models) and **LIME** (for the LSTM)
 
 The best model (XGBoost) achieves R²=0.994 and RMSE=1.30 at 1h. The 24h Ridge model achieves R²=0.549 and RMSE=11.76. Full methodology and evaluation are in the notebooks.
+
+---
+
+## 🌐 Web Dashboard
+
+**Live:** https://karachi-aqi-prediction.streamlit.app
+
+**Features:**
+- Real-time AQI display with EPA health category and color coding
+- 72-hour interactive forecast chart with hover scrubbing
+- 3-day daily summary cards (avg / min / max AQI)
+- SHAP feature importance bar chart for model explainability
+- Health advisory with actionable recommendations per AQI level
+- Ensemble model comparison table (Ridge, RandomForest, XGBoost, LSTM)
+- Auto-refreshes data every hour via `@st.cache_data(ttl=3600)`
+
+---
+
+## 🔌 REST API
+
+FastAPI backend with auto-generated Swagger documentation — deployed on **Hugging Face Spaces**.
+
+**Live API:** https://gehna88-karachi-aqi-api.hf.space  
+**Interactive Docs:** https://gehna88-karachi-aqi-api.hf.space/docs
+
+**Run locally:**
+```bash
+uvicorn api.api:app --reload --port 8000
+```
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | API info and health status |
+| `GET /current` | Current AQI + weather snapshot + category |
+| `GET /predict` | Full 72h forecast + ensemble inference |
+| `GET /history?n=24` | Last N hourly readings from MongoDB |
+| `GET /stats` | Dataset summary statistics |
 
 ---
 
@@ -43,15 +92,17 @@ The best model (XGBoost) achieves R²=0.994 and RMSE=1.30 at 1h. The 24h Ridge m
           │                                   │
           └───────────────┬───────────────────┘
                           ▼
-                 Streamlit Dashboard
-                 (inference + alerts + SHAP)
+             ┌────────────────────────┐
+             │   Streamlit Dashboard  │  ← karachi-aqi-prediction.streamlit.app
+             │   FastAPI Backend      │  ← gehna88-karachi-aqi-api.hf.space
+             └────────────────────────┘
 ```
 
 **Data flow:**
 1. Open-Meteo AQ API + OpenWeatherMap → raw hourly reading → `feature_pipeline.py`
 2. Feature engineering (60 features: lags, rolling stats, cyclic time, weather interactions) → MongoDB Atlas
 3. Daily: fetch full feature history → train 4 models × 4 horizons → ensemble weights → Hopsworks
-4. Dashboard: load latest feature row from MongoDB + models from Hopsworks → predict Δ_AQI → reconstruct AQI
+4. Dashboard + API: load latest feature row from MongoDB + models from Hopsworks → predict Δ_AQI → reconstruct AQI
 5. SHAP + LIME explanations generated in `notebooks/SHAP_LIME_EXPLANATION.ipynb`
 
 ---
@@ -66,8 +117,9 @@ The best model (XGBoost) achieves R²=0.994 and RMSE=1.30 at 1h. The 24h Ridge m
 | Models | Ridge Regression, RandomForest, XGBoost, LSTM (TensorFlow/Keras) |
 | Explainability | SHAP (LinearExplainer, TreeExplainer) + LIME (LimeTabularExplainer) |
 | Dashboard | Streamlit + Plotly |
+| REST API | FastAPI + Uvicorn (Hugging Face Spaces) |
 | Orchestration | GitHub Actions + cron-job.org |
-| Deployment | Streamlit Cloud (Python 3.11.9) |
+| Deployment | Streamlit Cloud (Python 3.11.9) + Hugging Face Spaces (Docker) |
 
 ---
 
@@ -76,7 +128,7 @@ The best model (XGBoost) achieves R²=0.994 and RMSE=1.30 at 1h. The 24h Ridge m
 ### Prerequisites
 
 - Python 3.11
-- Free accounts: MongoDB Atlas, Hopsworks, OpenWeatherMap
+- Free accounts: MongoDB Atlas, Hopsworks, OpenWeatherMap, Hugging Face
 
 ### Installation
 
@@ -84,24 +136,15 @@ The best model (XGBoost) achieves R²=0.994 and RMSE=1.30 at 1h. The 24h Ridge m
 git clone https://github.com/gehna88/AQI-Prediction.git
 cd AQI-Prediction
 
-# Windows — create venv OUTSIDE OneDrive to avoid file corruption
 python -m venv C:\venvs\aqi-predictor
 C:\venvs\aqi-predictor\Scripts\Activate.ps1
 
-# macOS / Linux
-python -m venv .venv && source .venv/bin/activate
-
 pip install -r requirements.txt
-pip install tensorflow==2.16.2   # Python 3.12 locally
 ```
 
 ### Configuration
 
-```bash
-cp .env.example .env
-```
-
-Fill in `.env`:
+Create a `.env` file:
 
 ```env
 HOPSWORKS_API_KEY=your_hopsworks_api_key
@@ -121,6 +164,9 @@ python pipelines/training_pipeline.py
 
 # Step 3 — launch dashboard
 streamlit run app/app.py
+
+# Step 4 — launch API
+uvicorn api.api:app --reload --port 8000
 ```
 
 ---
@@ -134,25 +180,10 @@ streamlit run app/app.py
 | `pipelines/training_pipeline.py` | Daily: load features → train Ridge/RF/XGBoost/LSTM → save to Hopsworks |
 | `pipelines/mongo_store.py` | MongoDB Atlas helper — `store_df()`, `read_df()`, `read_latest()` |
 | `app/app.py` | Streamlit dashboard — live AQI, 3-day forecast, health alerts |
-| `notebooks/EDA_KARACHI.ipynb` | 173-day EDA — distribution, seasonality, ACF/PACF, correlations |
+| `api/api.py` | FastAPI backend — REST endpoints for AQI data and predictions |
+| `api/Dockerfile` | Docker config for Hugging Face Spaces deployment |
+| `notebooks/EDA_KARACHI.ipynb` | 180-day EDA — distribution, seasonality, ACF/PACF, correlations |
 | `notebooks/SHAP_LIME_EXPLANATION.ipynb` | SHAP global importance + cross-horizon heatmap + LIME for LSTM |
-
----
-
-## MongoDB Collections
-
-| Collection | Contents |
-|-----------|---------|
-| `aqi_predictor.features` | One document per hour; 60 engineered features + AQI targets |
-
-## Hopsworks Model Registry
-
-| Model | Contents |
-|-------|---------|
-| `aqi_model_1h` | Ridge + RF + XGBoost + LSTM artefacts, scaler, ensemble weights |
-| `aqi_model_24h` | Same |
-| `aqi_model_48h` | Same |
-| `aqi_model_72h` | Same |
 
 ---
 
@@ -167,16 +198,13 @@ All models predict **Δ_AQI** (change from current reading). Reconstruction: `pr
 | 48h | Ridge (α=500) | 18.01 | 0.441 |
 | 72h | Ridge (α=500) | 19.09 | 0.201 |
 
-
 ---
 
 ## CI/CD
 
-Two GitHub Actions workflows triggered via `workflow_dispatch` from **cron-job.org**:
-
 | Workflow | Schedule | Steps |
 |---------|---------|-------|
-| `feature_pipeline.yml` | Every hour | Fetch AQ + weather → engineer features → upsert to MongoDB |
+| `feature_pipeline.yml` | Every hour (cron-job.org) | Fetch AQ + weather → engineer features → upsert to MongoDB |
 | `training_pipeline.yml` | Daily 02:00 UTC | Train models → compute ensemble weights → save to Hopsworks |
 
 **Required GitHub Secrets:**
@@ -187,18 +215,6 @@ Two GitHub Actions workflows triggered via `workflow_dispatch` from **cron-job.o
 | `HOPSWORKS_PROJECT` | Hopsworks project name |
 | `OPENWEATHER_API_KEY` | OpenWeatherMap API key |
 | `MONGODB_URI` | MongoDB Atlas connection string |
-
-> **MongoDB Atlas network access:** Add `0.0.0.0/0` to allow GitHub Actions runners which use dynamic IPs.
-
-**cron-job.org setup (one-time):**
-
-```
-URL:     https://api.github.com/repos/YOUR_USERNAME/YOUR_REPO/actions/workflows/feature_pipeline.yml/dispatches
-Method:  POST
-Headers: Authorization: Bearer YOUR_GITHUB_PAT
-Body:    {"ref":"main"}
-Schedule: 0 * * * *
-```
 
 ---
 
@@ -212,9 +228,3 @@ Schedule: 0 * * * *
 | 151–200 | 🔴 Unhealthy | Avoid prolonged outdoor exposure |
 | 201–300 | 🟣 Very Unhealthy | Stay indoors |
 | 301+ | 🟤 Hazardous | Emergency conditions |
-
----
-
-## License
-
-MIT License — see [LICENSE](LICENSE) for details.
