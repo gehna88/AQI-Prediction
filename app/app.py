@@ -1,18 +1,3 @@
-"""
-app.py  –  v5
-
-Changes vs v4:
-  1. Ensemble inference — loads all model artifacts + weights, blends predictions
-  2. Side-by-side UI — AQI banner left, pollutants + weather right
-  3. Fixed: UserWarning "X does not have valid feature names"
-     Pass DataFrame (not .values) to scaler.transform() so column names are kept
-  4. Fixed: use_container_width → width='stretch' (Streamlit deprecation)
-  5. Fixed: InconsistentVersionWarning — suppress with warnings.filterwarnings
-     The versions differ between CI (1.7.2) and local (1.9.0). Predictions are
-     still correct for RF/Ridge across minor sklearn versions. Suppressed so
-     the terminal output is readable.
-"""
-
 import os
 import warnings
 import joblib
@@ -395,7 +380,7 @@ if has_direct:
                                  ensemble_all, ensemble_wts)
     p72, s72 = predict_ensemble("72h", df, best_models, scalers,
                                  ensemble_all, ensemble_wts)
-    method = f"Direct 24h/48h/72h models ({s24}/{s48}/{s72})"
+    method = f"24h/48h/72h prediction"
 elif has_1h:
     hourly = iterative_1h_forecast(df, best_models, scalers, 72)
     p24    = float(np.mean(hourly[0:24]))  if len(hourly) >= 24 else current_aqi
@@ -424,7 +409,7 @@ for col, (day, pred) in zip([fc1, fc2, fc3], [
         <div style='color:{tc2};font-size:12px;opacity:0.9'>{lbl2}</div>
         </div>""", unsafe_allow_html=True)
 
-st.caption(f"Forecast method: {method}")
+st.caption(f"Forecast : {method}")
 
 # ══════════════════════════════════════════════════════════════════════
 # ALERT SYSTEM — current + forecast, with health guidance
@@ -575,6 +560,5 @@ st.dataframe(pd.DataFrame({
 st.divider()
 st.caption(
     "Data: Open-Meteo (AQ) + OpenWeather · "
-    "Feature store & models: Hopsworks · "
     "Pipeline: GitHub Actions · Built with Streamlit"
 )

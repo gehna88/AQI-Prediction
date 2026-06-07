@@ -1,61 +1,3 @@
-"""
-training_pipeline.py  –  v6
-
-WHAT CHANGED vs v5 and WHY:
-=============================================================================
-
-CHANGE 1 — Differenced targets (highest impact)
-  v5: target_resid = target_Xh - aqi_trend(T)
-      At reconstruction: predicted_aqi = residual + trend(T)
-      Problem: trend(T) is the 7-day mean ENDING at T, but the target is
-      AQI at T+48. If trend is still shifting upward in that window,
-      trend(T) underestimates the true level → systematic offset → r2 < 0
-      even though r2_resid was positive (model was learning correctly).
-
-  v6: target_Xh_diff = target_Xh - aqi_current (at time T, NOT at T+X)
-      At reconstruction: predicted_aqi = aqi_now + predicted_diff
-      aqi_now is always exactly known at inference. No trend needed.
-      No lookup table. No offset error. Cleaner stationarity for LSTM.
-  
-  This is the correct formulation: the model predicts HOW MUCH AQI will
-  change over the next X hours, not what the absolute level will be.
-  The strong negative correlation (r≈-0.43) between aqi_now and the diff
-  (mean reversion: high AQI tends to fall) becomes the primary signal.
-
-CHANGE 2 — Extended lag features in FEATURES list
-  Added: aqi_lag72, aqi_lag96, aqi_lag120, aqi_lag168
-  Added: aqi_roll48_mean, aqi_roll72_mean
-  These were added to backfill and feature_pipeline schemas (v6).
-  Weekly lag (168h) captures same-hour-last-week traffic patterns.
-  Long rolling means capture mean-reversion: if roll48_mean >> aqi_now,
-  AQI is likely to rise back toward baseline (and vice versa).
-  aqi_roll168_mean skipped — redundant with aqi_trend.
-
-CHANGE 3 — Ridge alpha tuned per horizon via TimeSeriesSplit CV
-  v5 used Ridge(alpha=1.0) for all horizons.
-  v6 searches alpha in [0.01, 0.1, 1, 10, 50, 100, 500] using
-  TimeSeriesSplit(n_splits=5). This finds the right regularisation
-  strength for each horizon separately:
-    1h:  likely alpha → small (strong clean signal)
-    24h: likely alpha → 1-10
-    48h/72h: likely alpha → 10-100 (weak noisy signal needs more shrinkage)
-  TimeSeriesSplit is used for alpha search only. Final reported metrics
-  still come from the single 80/20 temporal split (reproducible baseline).
-
-CHANGE 4 — RandomForest hyperparameters improved
-  n_estimators 300 → 500, max_depth 10 → 12.
-  min_samples_leaf stays at 3 (prevents overfitting on 1944 rows).
-  Depth 12 is a compromise: deeper than 10 to find interactions,
-  shallower than the suggested 15 which would overfit on this dataset size.
-
-CHANGE 5 — aqi_trend removed as primary deseasonalizer, kept as feature
-  With differenced targets, aqi_trend is no longer needed for target
-  construction. It is still included in FEATURES because it provides
-  a smooth representation of the current level baseline — useful context
-  for the model even if it no longer plays a structural role.
-=============================================================================
-"""
-
 import os
 import sys
 import shutil
@@ -83,8 +25,8 @@ except ImportError:
 
 try:
     import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers
+    keras = tf.keras
+    layers = tf.keras.layers
     LSTM_AVAILABLE = True
 except ImportError:
     LSTM_AVAILABLE = False
@@ -266,20 +208,6 @@ def prepare_data(df, raw_target_col, diff_target_col):
 
 
 def tune_ridge_alpha(X_train, y_train):
-    """
-    Find the best Ridge alpha for this horizon using TimeSeriesSplit CV.
-    CV is on the TRAINING set only — no test-set contamination.
-
-    n_splits=3 instead of 5:
-      With 1555 train rows and 5 splits, fold 1 had only 258 rows —
-      too small for the noisy 24h/48h/72h diff signal. CV always picked
-      alpha=500 (near-zero prediction) on tiny folds. With n_splits=3,
-      fold 1 has 388 rows (50% more), giving a more reliable alpha estimate.
-
-    Alpha range starts at 0.001:
-      Ensures the search can pick a low alpha for the clean 1h signal
-      where aggressive regularisation was actively hurting R²_diff.
-    """
     alphas     = [0.001, 0.01, 0.1, 1, 10, 50, 100, 500]
     tscv       = TimeSeriesSplit(n_splits=3)
     best_alpha = 1.0
@@ -471,17 +399,6 @@ def train_models(X_train, X_test,
 
 
 def compute_ensemble_weights(results_dict, horizon):
-    """
-    Compute R²-proportional weights for ensemble blending.
-    Only include models with positive R² (negative R² models hurt the ensemble).
-    Returns a dict: {model_name: weight} that sums to 1.0.
-
-    Rationale per horizon:
-      1h:  RF near-perfect → RF dominates; LSTM slightly negative → exclude
-      24h: RF best → RF×0.6 + LSTM×0.4 (when LSTM R² is positive)
-      48h: LSTM best → LSTM×0.6 + Ridge×0.4
-      72h: LSTM dominates → LSTM×0.65 + Ridge×0.35
-    """
     # Filter to models with positive R²
     positive = {k: v for k, v in results_dict.items() if v["r2"] > 0}
     if not positive:
@@ -502,16 +419,6 @@ def compute_ensemble_weights(results_dict, horizon):
 
 
 def save_models(horizon_results, project):
-    """
-    Save all trained models for each horizon plus ensemble weights.
-    The model bundle contains:
-      - model_{horizon}.pkl         : best single model (sklearn/XGBoost)
-      - lstm_model_{horizon}.keras  : LSTM model (if LSTM was trained)
-      - all_{horizon}.pkl           : all model results (for ensemble)
-      - ensemble_weights_{horizon}.pkl : {model_name: weight}
-      - scaler_{horizon}.pkl        : StandardScaler fitted on training data
-      - meta_{horizon}.pkl          : reconstruction metadata
-    """
     mr = project.get_model_registry()
 
     for horizon, (all_results, best_name) in horizon_results.items():

@@ -1,9 +1,29 @@
+# Virtual environments
 venv/
 .venv/
+
+# Environment variables — never commit secrets
 .env
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+
+# Model artifacts — too large for git, stored in Hopsworks
 *.pkl
 *.keras
+
+# Compiled extensions
 *.dll
-*.sogit add .gitignore
+*.so
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data files — stored in Hopsworks, not in git
+data/processed/
